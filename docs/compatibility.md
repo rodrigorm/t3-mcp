@@ -22,12 +22,26 @@ The upstream pairing grant is exchanged for a short-lived environment session. I
 stored after the exchange. The bearer session is stored privately for later workflow slices.
 DPoP is not requested because this connector does not implement DPoP proof keys.
 
+## Orchestration Read Contract
+
+1. Read `GET /api/orchestration/snapshot` with the saved bearer session and map active upstream
+   projects' `id` and `title` to public `id` and `name` values.
+2. Read `GET /api/orchestration/threads/:threadId` with `turnLimit` and optional `beforeCursor`
+   query parameters. The upstream `page.beforeCursor` is returned as `nextCursor`; `hasMore` is
+   also exposed as `truncated` so omitted history is explicit.
+3. Map `latestTurn` and `session` states without treating unknown values as completed. Unresolved
+   `approval.requested` activities produce `approval_required`; approval is handled in T3 Code.
+
+Thread reads default to 20 user-anchored turns and accept at most 100 per request. Each request is
+bounded by the connector's 10-second timeout and uses only the selected environment's session.
+
 ## Verification
 
 The automated tests run an actual MCP client against the stdio connector and controlled HTTP
 servers implementing this contract. They cover descriptor and token exchange, invalid grants,
-restart persistence, failed replacement, two-environment registration isolation, malformed and
-insecure URLs, redaction, owner-only storage, and redirect rejection.
+restart persistence, failed replacement, two-environment registration isolation, project discovery,
+thread status mapping, bounded pagination, malformed and insecure URLs, redaction, owner-only
+storage, and redirect rejection.
 
 A live direct-pairing smoke check against a real T3 environment without Connect is not recorded
 in this repository: this workspace has no operator-provided environment endpoint and grant.

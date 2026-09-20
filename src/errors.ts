@@ -5,6 +5,8 @@ export type ConnectorErrorCode =
   | "upstream_incompatible"
   | "pairing_rejected"
   | "permission_denied"
+  | "session_expired"
+  | "thread_not_found"
   | "transport_error"
   | "environment_exists"
   | "environment_not_found"

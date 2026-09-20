@@ -1,5 +1,7 @@
 export const SUPPORTED_ORCHESTRATION_PROTOCOL_VERSION = 1;
 export const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
+export const DEFAULT_THREAD_HISTORY_TURN_LIMIT = 20;
+export const MAX_THREAD_HISTORY_TURN_LIMIT = 100;
 
 export interface EnvironmentDescriptor {
   readonly environmentId: string;
@@ -43,4 +45,60 @@ export interface PairingResult {
   readonly sessionExpiresAt: string;
   readonly scopes: readonly string[];
   readonly tokenType: "Bearer";
+}
+
+export interface PublicProject {
+  readonly id: string;
+  readonly name: string;
+}
+
+export type PublicThreadStatus =
+  | "idle"
+  | "starting"
+  | "running"
+  | "completed"
+  | "interrupted"
+  | "error"
+  | "approval_required"
+  | "input_required"
+  | "unknown";
+
+export interface PublicThreadMessage {
+  readonly id: string;
+  readonly role: string;
+  readonly text: string;
+  readonly turnId: string | null;
+  readonly streaming: boolean;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PublicThreadActivity {
+  readonly id: string;
+  readonly tone: string;
+  readonly kind: string;
+  readonly summary: string;
+  readonly turnId: string | null;
+  readonly createdAt: string;
+}
+
+export interface PublicThreadHistory {
+  readonly turnLimit: number;
+  readonly hasMore: boolean;
+  readonly nextCursor: string | null;
+  readonly truncated: boolean;
+  readonly snapshotSequence: number;
+  readonly threadSequence?: number;
+}
+
+export interface PublicThread {
+  readonly environmentId: string;
+  readonly id: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly status: PublicThreadStatus;
+  readonly upstreamState?: string;
+  readonly messages: readonly PublicThreadMessage[];
+  readonly activities: readonly PublicThreadActivity[];
+  readonly history: PublicThreadHistory;
 }

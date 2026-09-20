@@ -23,6 +23,13 @@ Issue #2 ships the pairing slice:
   `environmentId` is required to replace an existing registration.
 - `list_environments`: returns saved environment metadata, scopes, and known session expiry.
 
+Issue #3 adds the read slice:
+
+- `list_projects`: requires `environmentId` and returns active project `id`/`name` pairs.
+- `get_thread`: requires `environmentId` and `threadId`; returns mapped execution status, messages,
+  activities, and bounded history. Pass `turnLimit` and the returned `nextCursor` as `beforeCursor`
+  to page older turns. Approval or input requests are reported for handling in T3 Code.
+
 Pairing URL fragments use the upstream form `#token=...`. The response never includes the
 grant, access token, authenticated URL, or raw upstream error body.
 

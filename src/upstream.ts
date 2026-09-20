@@ -3,8 +3,15 @@ import { endpointPath, publicEndpoint, type ValidatedEndpoint } from "./url.js";
 import {
   REQUIRED_SCOPES,
   SUPPORTED_ORCHESTRATION_PROTOCOL_VERSION,
+  DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+  type PairedEnvironment,
   type EnvironmentDescriptor,
   type PairingResult,
+  type PublicProject,
+  type PublicThread,
+  type PublicThreadActivity,
+  type PublicThreadMessage,
+  type PublicThreadStatus,
 } from "./types.js";
 
 const TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -58,7 +65,7 @@ function parseDescriptor(value: unknown): EnvironmentDescriptor {
 async function request(
   url: URL,
   init: RequestInit,
-  errorCode: "descriptor" | "pairing" | "session",
+  errorCode: "descriptor" | "pairing" | "session" | "projects" | "thread",
 ): Promise<Response> {
   let response: Response;
   try {
@@ -80,11 +87,22 @@ async function request(
     if (errorCode === "pairing" && (response.status === 401 || response.status === 400)) {
       throw new ConnectorError("pairing_rejected", "The environment rejected the pairing grant.");
     }
+    if ((errorCode === "projects" || errorCode === "thread") && response.status === 401) {
+      throw new ConnectorError(
+        "session_expired",
+        "The saved environment session expired or was revoked; pair the environment again.",
+      );
+    }
     if (response.status === 403) {
       throw new ConnectorError("permission_denied", "The environment denied this operation.");
     }
+    if (errorCode === "thread" && response.status === 404) {
+      throw new ConnectorError("thread_not_found", "The requested thread was not found.");
+    }
     throw new ConnectorError(
-      errorCode === "descriptor" ? "upstream_incompatible" : "transport_error",
+      errorCode === "descriptor" || errorCode === "projects" || errorCode === "thread"
+        ? "upstream_incompatible"
+        : "transport_error",
       "The environment returned an unsupported response.",
     );
   }
@@ -194,6 +212,287 @@ export async function pairEnvironment(
     scopes: REQUIRED_SCOPES,
     tokenType: "Bearer",
   };
+}
+
+function invalidOrchestration(message: string): never {
+  throw new ConnectorError("upstream_incompatible", message);
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || requiredString(value);
+}
+
+function parseProjects(value: unknown): readonly PublicProject[] {
+  if (!isRecord(value) || !Array.isArray(value.projects)) {
+    return invalidOrchestration("The environment returned an invalid project snapshot.");
+  }
+
+  const projects: PublicProject[] = [];
+  for (const project of value.projects) {
+    if (
+      !isRecord(project) ||
+      !requiredString(project.id) ||
+      !requiredString(project.title) ||
+      (project.deletedAt !== undefined &&
+        project.deletedAt !== null &&
+        !requiredString(project.deletedAt))
+    ) {
+      return invalidOrchestration("The environment returned an invalid project snapshot.");
+    }
+    if (project.deletedAt !== undefined && project.deletedAt !== null) continue;
+    projects.push({ id: project.id.trim(), name: project.title.trim() });
+  }
+  return projects;
+}
+
+interface UpstreamActivity extends PublicThreadActivity {
+  readonly payload: unknown;
+}
+
+function parseMessages(value: unknown): readonly PublicThreadMessage[] {
+  if (!Array.isArray(value)) {
+    return invalidOrchestration("The environment returned an invalid thread snapshot.");
+  }
+
+  const messages: PublicThreadMessage[] = [];
+  for (const message of value) {
+    if (
+      !isRecord(message) ||
+      !requiredString(message.id) ||
+      !requiredString(message.role) ||
+      typeof message.text !== "string" ||
+      !nullableString(message.turnId) ||
+      typeof message.streaming !== "boolean" ||
+      !requiredString(message.createdAt) ||
+      !requiredString(message.updatedAt)
+    ) {
+      return invalidOrchestration("The environment returned an invalid thread snapshot.");
+    }
+    messages.push({
+      id: message.id.trim(),
+      role: message.role.trim(),
+      text: message.text,
+      turnId: message.turnId === null ? null : message.turnId.trim(),
+      streaming: message.streaming,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+    });
+  }
+  return messages;
+}
+
+function parseActivities(value: unknown): readonly UpstreamActivity[] {
+  if (!Array.isArray(value)) {
+    return invalidOrchestration("The environment returned an invalid thread snapshot.");
+  }
+
+  const activities: UpstreamActivity[] = [];
+  for (const activity of value) {
+    if (
+      !isRecord(activity) ||
+      !requiredString(activity.id) ||
+      !requiredString(activity.tone) ||
+      !requiredString(activity.kind) ||
+      !requiredString(activity.summary) ||
+      !nullableString(activity.turnId) ||
+      !requiredString(activity.createdAt)
+    ) {
+      return invalidOrchestration("The environment returned an invalid thread snapshot.");
+    }
+    activities.push({
+      id: activity.id.trim(),
+      tone: activity.tone.trim(),
+      kind: activity.kind.trim(),
+      summary: activity.summary.trim(),
+      turnId: activity.turnId === null ? null : activity.turnId.trim(),
+      createdAt: activity.createdAt,
+      payload: activity.payload,
+    });
+  }
+  return activities;
+}
+
+function pendingRequestKind(activities: readonly UpstreamActivity[]): "approval" | "input" | null {
+  const pending = new Map<string, "approval" | "input">();
+  for (const activity of activities) {
+    const payload = isRecord(activity.payload) ? activity.payload : undefined;
+    const requestId = requiredString(payload?.requestId) ? payload.requestId.trim() : undefined;
+    if (activity.kind === "approval.requested" || activity.kind === "user-input.requested") {
+      pending.set(requestId ?? activity.id, activity.kind === "approval.requested" ? "approval" : "input");
+      continue;
+    }
+    if (requestId === undefined) continue;
+    if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") {
+      pending.delete(requestId);
+      continue;
+    }
+    if (
+      activity.kind === "provider.approval.respond.failed" ||
+      activity.kind === "provider.user-input.respond.failed"
+    ) {
+      const detail = typeof payload?.detail === "string" ? payload.detail.toLowerCase() : "";
+      if (detail.includes("stale") || detail.includes("unknown")) pending.delete(requestId);
+    }
+  }
+  if ([...pending.values()].includes("approval")) return "approval";
+  if (pending.size > 0) return "input";
+  return null;
+}
+
+function parseThreadState(
+  thread: Record<string, unknown>,
+): { readonly latestState?: string; readonly sessionStatus?: string } {
+  if (!("latestTurn" in thread) || !("session" in thread)) {
+    return invalidOrchestration("The environment returned an invalid thread snapshot.");
+  }
+
+  let latestState: string | undefined;
+  if (thread.latestTurn !== null) {
+    if (!isRecord(thread.latestTurn) || !requiredString(thread.latestTurn.state)) {
+      return invalidOrchestration("The environment returned an invalid thread snapshot.");
+    }
+    latestState = thread.latestTurn.state.trim();
+  }
+
+  let sessionStatus: string | undefined;
+  if (thread.session !== null) {
+    if (!isRecord(thread.session) || !requiredString(thread.session.status)) {
+      return invalidOrchestration("The environment returned an invalid thread snapshot.");
+    }
+    sessionStatus = thread.session.status.trim();
+  }
+  return { latestState, sessionStatus };
+}
+
+function mapThreadStatus(
+  latestState: string | undefined,
+  sessionStatus: string | undefined,
+  pending: "approval" | "input" | null,
+): PublicThreadStatus {
+  if (pending === "approval") return "approval_required";
+  if (pending === "input") return "input_required";
+  if (sessionStatus === "starting") return "starting";
+  if (sessionStatus === "running") return "running";
+  if (sessionStatus === "error") return "error";
+  if (sessionStatus !== undefined && !["idle", "ready", "interrupted", "stopped"].includes(sessionStatus)) {
+    return "unknown";
+  }
+  if (latestState === "running") return "running";
+  if (latestState === "completed") return "completed";
+  if (latestState === "interrupted") return "interrupted";
+  if (latestState === "error") return "error";
+  if (latestState !== undefined) return "unknown";
+  if (sessionStatus === "interrupted" || sessionStatus === "stopped") return "interrupted";
+  return "idle";
+}
+
+function parseHistory(
+  value: unknown,
+  turnLimit: number,
+  snapshotSequence: number,
+): PublicThread["history"] {
+  if (value === undefined) {
+    return {
+      turnLimit,
+      hasMore: false,
+      nextCursor: null,
+      truncated: false,
+      snapshotSequence,
+    };
+  }
+  if (
+    !isRecord(value) ||
+    !nullableString(value.beforeCursor) ||
+    typeof value.hasMore !== "boolean" ||
+    !nonNegativeInteger(value.snapshotSequence) ||
+    (value.threadSequence !== undefined && !nonNegativeInteger(value.threadSequence))
+  ) {
+    return invalidOrchestration("The environment returned invalid thread pagination metadata.");
+  }
+  return {
+    turnLimit,
+    hasMore: value.hasMore,
+    nextCursor: value.beforeCursor === null ? null : value.beforeCursor.trim(),
+    truncated: value.hasMore,
+    snapshotSequence: value.snapshotSequence,
+    ...(value.threadSequence === undefined ? {} : { threadSequence: value.threadSequence }),
+  };
+}
+
+function parseThread(
+  value: unknown,
+  environmentId: string,
+  requestedThreadId: string,
+  turnLimit: number,
+): PublicThread {
+  if (
+    !isRecord(value) ||
+    !nonNegativeInteger(value.snapshotSequence) ||
+    !isRecord(value.thread) ||
+    !requiredString(value.thread.id) ||
+    !requiredString(value.thread.projectId) ||
+    !requiredString(value.thread.title)
+  ) {
+    return invalidOrchestration("The environment returned an invalid thread snapshot.");
+  }
+  if (value.thread.id.trim() !== requestedThreadId) {
+    return invalidOrchestration("The environment returned a different thread than requested.");
+  }
+
+  const messages = parseMessages(value.thread.messages);
+  const activities = parseActivities(value.thread.activities);
+  const states = parseThreadState(value.thread);
+  const pending = pendingRequestKind(activities);
+  const unknownState = [states.latestState, states.sessionStatus].find(
+    (state) =>
+      state !== undefined &&
+      !["idle", "starting", "running", "ready", "interrupted", "stopped", "error", "completed"].includes(state),
+  );
+  const upstreamState = unknownState ?? states.sessionStatus ?? states.latestState;
+  return {
+    environmentId,
+    id: value.thread.id.trim(),
+    projectId: value.thread.projectId.trim(),
+    title: value.thread.title.trim(),
+    status: mapThreadStatus(states.latestState, states.sessionStatus, pending),
+    ...(upstreamState === undefined ? {} : { upstreamState }),
+    messages,
+    activities: activities.map(({ payload: _payload, ...activity }) => activity),
+    history: parseHistory(value.page, turnLimit, value.snapshotSequence),
+  };
+}
+
+export async function listProjects(environment: PairedEnvironment): Promise<readonly PublicProject[]> {
+  const response = await request(
+    endpointPath(new URL(environment.endpoint), "/api/orchestration/snapshot"),
+    { method: "GET", headers: { authorization: `${environment.tokenType} ${environment.accessToken}` } },
+    "projects",
+  );
+  return parseProjects(await json(response, "upstream_incompatible"));
+}
+
+export async function getThread(
+  environment: PairedEnvironment,
+  threadId: string,
+  turnLimit = DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+  beforeCursor?: string,
+): Promise<PublicThread> {
+  const url = endpointPath(
+    new URL(environment.endpoint),
+    `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
+  );
+  url.searchParams.set("turnLimit", String(turnLimit));
+  if (beforeCursor !== undefined) url.searchParams.set("beforeCursor", beforeCursor);
+  const response = await request(
+    url,
+    { method: "GET", headers: { authorization: `${environment.tokenType} ${environment.accessToken}` } },
+    "thread",
+  );
+  return parseThread(await json(response, "upstream_incompatible"), environment.environmentId, threadId, turnLimit);
 }
 
 export { publicEndpoint };

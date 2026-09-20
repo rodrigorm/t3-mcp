@@ -1,8 +1,20 @@
 import { ConnectorError } from "./errors.js";
 import { EnvironmentStore } from "./storage.js";
-import { pairEnvironment, publicEndpoint } from "./upstream.js";
+import {
+  getThread as getUpstreamThread,
+  listProjects as listUpstreamProjects,
+  pairEnvironment,
+  publicEndpoint,
+} from "./upstream.js";
 import { parseEndpoint } from "./url.js";
-import type { PairedEnvironment, PublicEnvironment } from "./types.js";
+import {
+  DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+  MAX_THREAD_HISTORY_TURN_LIMIT,
+  type PairedEnvironment,
+  type PublicEnvironment,
+  type PublicProject,
+  type PublicThread,
+} from "./types.js";
 
 export interface AddEnvironmentInput {
   readonly pairingUrl?: string;
@@ -10,6 +22,13 @@ export interface AddEnvironmentInput {
   readonly grant?: string;
   readonly label?: string;
   readonly environmentId?: string;
+}
+
+export interface GetThreadInput {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly turnLimit?: number;
+  readonly beforeCursor?: string;
 }
 
 function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
@@ -39,6 +58,25 @@ function cleanLabel(label: string | undefined, fallback: string, secrets: readon
 
 export class EnvironmentConnector {
   constructor(private readonly store: EnvironmentStore) {}
+
+  private async selectEnvironment(environmentId: string): Promise<PairedEnvironment> {
+    if (typeof environmentId !== "string" || !environmentId.trim()) {
+      throw new ConnectorError("invalid_input", "environmentId is required.");
+    }
+    const environments = await this.store.read();
+    const environment = environments.get(environmentId.trim());
+    if (!environment) {
+      throw new ConnectorError("environment_not_found", "The selected environment is not saved.");
+    }
+    const expiresAt = Date.parse(environment.sessionExpiresAt);
+    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+      throw new ConnectorError(
+        "session_expired",
+        "The saved environment session expired or was revoked; pair the environment again.",
+      );
+    }
+    return environment;
+  }
 
   async addEnvironment(input: AddEnvironmentInput): Promise<PublicEnvironment> {
     if (input.pairingUrl && input.endpoint) {
@@ -101,5 +139,33 @@ export class EnvironmentConnector {
     return [...environments.values()]
       .sort((left, right) => left.label.localeCompare(right.label) || left.environmentId.localeCompare(right.environmentId))
       .map(publicEnvironment);
+  }
+
+  async listProjects(environmentId: string): Promise<readonly PublicProject[]> {
+    return listUpstreamProjects(await this.selectEnvironment(environmentId));
+  }
+
+  async getThread(input: GetThreadInput): Promise<PublicThread> {
+    const environment = await this.selectEnvironment(input.environmentId);
+    const threadId = input.threadId.trim();
+    if (!threadId) {
+      throw new ConnectorError("invalid_input", "threadId is required.");
+    }
+    const turnLimit = input.turnLimit ?? DEFAULT_THREAD_HISTORY_TURN_LIMIT;
+    if (
+      !Number.isInteger(turnLimit) ||
+      turnLimit < 1 ||
+      turnLimit > MAX_THREAD_HISTORY_TURN_LIMIT
+    ) {
+      throw new ConnectorError(
+        "invalid_input",
+        `turnLimit must be an integer from 1 to ${MAX_THREAD_HISTORY_TURN_LIMIT}.`,
+      );
+    }
+    const beforeCursor = input.beforeCursor?.trim();
+    if (input.beforeCursor !== undefined && !beforeCursor) {
+      throw new ConnectorError("invalid_input", "beforeCursor must not be empty.");
+    }
+    return getUpstreamThread(environment, threadId, turnLimit, beforeCursor);
   }
 }

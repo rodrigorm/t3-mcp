@@ -36,7 +36,24 @@ async function startHttpServer(handler) {
   };
 }
 
-async function startEnvironment({ id, label, grants, redirectTo } = {}) {
+async function configuredResponse(value, url) {
+  return typeof value === "function" ? value(url) : value;
+}
+
+async function writeConfiguredResponse(response, value, url, fallbackStatus = 200) {
+  const resolved = await configuredResponse(value, url);
+  if (
+    resolved &&
+    typeof resolved === "object" &&
+    "status" in resolved &&
+    "body" in resolved
+  ) {
+    return jsonResponse(response, resolved.status, resolved.body);
+  }
+  return jsonResponse(response, fallbackStatus, resolved);
+}
+
+async function startEnvironment({ id, label, grants, redirectTo, projects = [], orchestration = {} } = {}) {
   const requests = [];
   const tokens = new Map();
   const server = await startHttpServer(async (request, response) => {
@@ -99,6 +116,40 @@ async function startEnvironment({ id, label, grants, redirectTo } = {}) {
       });
     }
 
+    if (request.method === "GET" && request.url?.startsWith("/api/orchestration/")) {
+      const token = request.headers.authorization?.replace(/^Bearer /, "");
+      if (!token || !tokens.has(token)) {
+        return jsonResponse(response, 401, { code: "auth_invalid", token: "secret-session-token" });
+      }
+      if (orchestration.status) {
+        return jsonResponse(response, orchestration.status, { code: "denied", detail: "private detail" });
+      }
+
+      const url = new URL(request.url, "http://environment.test");
+      if (url.pathname === "/api/orchestration/snapshot") {
+        const snapshot =
+          orchestration.snapshot ?? {
+            snapshotSequence: 1,
+            projects,
+            threads: [],
+            updatedAt: new Date().toISOString(),
+          };
+        return writeConfiguredResponse(response, snapshot, url);
+      }
+
+      const threadPrefix = "/api/orchestration/threads/";
+      if (url.pathname.startsWith(threadPrefix)) {
+        const threadId = decodeURIComponent(url.pathname.slice(threadPrefix.length));
+        const thread = await configuredResponse(orchestration.thread, url);
+        const configuredThread =
+          thread ?? (orchestration.threads instanceof Map ? orchestration.threads.get(threadId) : undefined);
+        if (configuredThread === undefined) {
+          return jsonResponse(response, 404, { code: "not_found", reason: "thread_not_found" });
+        }
+        return writeConfiguredResponse(response, configuredThread, url);
+      }
+    }
+
     response.writeHead(404);
     response.end();
   });
@@ -127,6 +178,92 @@ function content(result) {
   return result.structuredContent ?? JSON.parse(result.content[0].text);
 }
 
+const NOW = "2026-09-20T00:00:00.000Z";
+
+function message(id, role, text) {
+  return {
+    id,
+    role,
+    text,
+    attachments: [],
+    turnId: "turn-1",
+    streaming: false,
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}
+
+function activity(kind, payload = {}) {
+  return {
+    id: `${kind}-activity`,
+    tone: kind === "approval.requested" ? "approval" : "info",
+    kind,
+    summary: kind,
+    payload,
+    turnId: "turn-1",
+    createdAt: NOW,
+  };
+}
+
+function threadSnapshot({
+  id = "thread-1",
+  projectId = "project-1",
+  title = "Thread",
+  latestState = "completed",
+  sessionStatus = "ready",
+  activities = [],
+  messages = [message("message-1", "assistant", "result")],
+  page,
+} = {}) {
+  return {
+    snapshotSequence: 7,
+    thread: {
+      id,
+      projectId,
+      title,
+      modelSelection: { instanceId: "default", model: "model" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      latestTurn:
+        latestState === null
+          ? null
+          : {
+              turnId: "turn-1",
+              state: latestState,
+              requestedAt: NOW,
+              startedAt: NOW,
+              completedAt: latestState === "completed" ? NOW : null,
+              assistantMessageId: "message-1",
+            },
+      createdAt: NOW,
+      updatedAt: NOW,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      deletedAt: null,
+      messages,
+      proposedPlans: [],
+      activities,
+      checkpoints: [],
+      session:
+        sessionStatus === null
+          ? null
+          : {
+              threadId: id,
+              status: sessionStatus,
+              providerName: "provider",
+              runtimeMode: "full-access",
+              activeTurnId: sessionStatus === "running" ? "turn-1" : null,
+              lastError: null,
+              updatedAt: NOW,
+            },
+    },
+    ...(page === undefined ? {} : { page }),
+  };
+}
+
 test("pairs, persists, re-pairs safely, and lists through the public MCP seam", async () => {
   const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-state-"));
   const environmentA = await startEnvironment({
@@ -149,7 +286,7 @@ test("pairs, persists, re-pairs safely, and lists through the public MCP seam", 
     const tools = await client.listTools();
     assert.deepEqual(
       tools.tools.map((tool) => tool.name).sort(),
-      ["add_environment", "list_environments"],
+      ["add_environment", "get_thread", "list_environments", "list_projects"],
     );
     assert.ok(tools.tools.find((tool) => tool.name === "add_environment").inputSchema.properties.pairingUrl);
 
@@ -291,6 +428,310 @@ test("rejects insecure input and redirects without forwarding the grant", async 
     await closeClient(client);
     await redirecting.close();
     await sink.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("discovers projects and retrieves environment-scoped thread states", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-reads-"));
+  const empty = await startEnvironment({
+    id: "environment-empty",
+    label: "Empty",
+    grants: new Map([["grant-empty", "token-empty"]]),
+  });
+  const environmentA = await startEnvironment({
+    id: "environment-a",
+    label: "Alpha",
+    grants: new Map([["grant-a", "token-a"]]),
+    projects: [{ id: "same-project", title: "Alpha project", deletedAt: null }],
+    orchestration: {
+      threads: new Map([
+        [
+          "same-thread",
+          threadSnapshot({ id: "same-thread", projectId: "same-project", title: "Alpha thread", latestState: "running", sessionStatus: "running" }),
+        ],
+        [
+          "approval-thread",
+          threadSnapshot({
+            id: "approval-thread",
+            projectId: "same-project",
+            title: "Approval thread",
+            latestState: "running",
+            sessionStatus: "running",
+            activities: [activity("approval.requested", { requestId: "request-1" })],
+          }),
+        ],
+        [
+          "unknown-thread",
+          threadSnapshot({
+            id: "unknown-thread",
+            projectId: "same-project",
+            latestState: "future-state",
+            sessionStatus: "ready",
+          }),
+        ],
+      ]),
+    },
+  });
+  const environmentB = await startEnvironment({
+    id: "environment-b",
+    label: "Beta",
+    grants: new Map([["grant-b", "token-b"]]),
+    projects: [{ id: "same-project", title: "Beta project", deletedAt: null }],
+    orchestration: {
+      threads: new Map([
+        [
+          "same-thread",
+          threadSnapshot({ id: "same-thread", projectId: "same-project", title: "Beta thread" }),
+        ],
+      ]),
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    for (const [environment, grant] of [
+      [empty, "grant-empty"],
+      [environmentA, "grant-a"],
+      [environmentB, "grant-b"],
+    ]) {
+      const paired = await client.callTool({
+        name: "add_environment",
+        arguments: { endpoint: environment.baseUrl, grant },
+      });
+      assert.equal(paired.isError, undefined);
+    }
+
+    const emptyProjects = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "environment-empty" },
+    });
+    assert.deepEqual(content(emptyProjects), {
+      environmentId: "environment-empty",
+      projects: [],
+    });
+
+    const projectsA = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "environment-a" },
+    });
+    assert.deepEqual(content(projectsA).projects, [{ id: "same-project", name: "Alpha project" }]);
+
+    const projectsB = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "environment-b" },
+    });
+    assert.deepEqual(content(projectsB).projects, [{ id: "same-project", name: "Beta project" }]);
+
+    const running = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-a", threadId: "same-thread" },
+    });
+    assert.equal(content(running).thread.environmentId, "environment-a");
+    assert.equal(content(running).thread.title, "Alpha thread");
+    assert.equal(content(running).thread.status, "running");
+    assert.equal(content(running).thread.messages[0].text, "result");
+
+    const completed = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-b", threadId: "same-thread" },
+    });
+    assert.equal(content(completed).thread.environmentId, "environment-b");
+    assert.equal(content(completed).thread.title, "Beta thread");
+    assert.equal(content(completed).thread.status, "completed");
+
+    const approval = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-a", threadId: "approval-thread" },
+    });
+    assert.equal(content(approval).thread.status, "approval_required");
+    assert.equal(content(approval).thread.activities[0].kind, "approval.requested");
+
+    const unknown = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-a", threadId: "unknown-thread" },
+    });
+    assert.equal(content(unknown).thread.status, "unknown");
+    assert.equal(content(unknown).thread.upstreamState, "future-state");
+
+    const routedA = environmentA.requests.filter((request) => request.path.startsWith("/api/orchestration/"));
+    const routedB = environmentB.requests.filter((request) => request.path.startsWith("/api/orchestration/"));
+    assert.ok(routedA.every((request) => request.headers.authorization === "Bearer token-a"));
+    assert.ok(routedB.every((request) => request.headers.authorization === "Bearer token-b"));
+    assert.equal(routedA.some((request) => request.path.includes("same-thread")), true);
+    assert.equal(routedB.some((request) => request.path.includes("same-thread")), true);
+  } finally {
+    await closeClient(client);
+    await empty.close();
+    await environmentA.close();
+    await environmentB.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("uses upstream thread pagination and reports explicit truncation", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-pagination-"));
+  const environment = await startEnvironment({
+    id: "environment-pagination",
+    label: "Pagination",
+    grants: new Map([["grant-pagination", "token-pagination"]]),
+    orchestration: {
+      thread: (url) =>
+        url.searchParams.get("beforeCursor") === "older-cursor"
+          ? threadSnapshot({
+              id: "paged-thread",
+              messages: [message("older-message", "assistant", "older")],
+              page: {
+                beforeCursor: null,
+                hasMore: false,
+                snapshotSequence: 9,
+                threadSequence: 8,
+              },
+            })
+          : threadSnapshot({
+              id: "paged-thread",
+              messages: [message("newer-message", "assistant", "newer")],
+              page: {
+                beforeCursor: "older-cursor",
+                hasMore: true,
+                snapshotSequence: 8,
+                threadSequence: 7,
+              },
+            }),
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-pagination" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    const first = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-pagination", threadId: "paged-thread", turnLimit: 2 },
+    });
+    assert.deepEqual(content(first).thread.history, {
+      turnLimit: 2,
+      hasMore: true,
+      nextCursor: "older-cursor",
+      truncated: true,
+      snapshotSequence: 8,
+      threadSequence: 7,
+    });
+
+    const second = await client.callTool({
+      name: "get_thread",
+      arguments: {
+        environmentId: "environment-pagination",
+        threadId: "paged-thread",
+        turnLimit: 2,
+        beforeCursor: "older-cursor",
+      },
+    });
+    assert.deepEqual(content(second).thread.history, {
+      turnLimit: 2,
+      hasMore: false,
+      nextCursor: null,
+      truncated: false,
+      snapshotSequence: 9,
+      threadSequence: 8,
+    });
+
+    const threadRequests = environment.requests.filter((request) => request.path.startsWith("/api/orchestration/threads/"));
+    assert.equal(new URL(`http://environment.test${threadRequests[0].path}`).searchParams.get("turnLimit"), "2");
+    assert.equal(new URL(`http://environment.test${threadRequests[1].path}`).searchParams.get("beforeCursor"), "older-cursor");
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("returns sanitized errors for missing, denied, expired, and malformed reads", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-read-errors-"));
+  const denied = await startEnvironment({
+    id: "environment-denied",
+    label: "Denied",
+    grants: new Map([["grant-denied", "token-denied"]]),
+    orchestration: { status: 403 },
+  });
+  const malformed = await startEnvironment({
+    id: "environment-malformed",
+    label: "Malformed",
+    grants: new Map([["grant-malformed", "token-malformed"]]),
+    orchestration: { snapshot: { snapshotSequence: 1, projects: "not-an-array" } },
+  });
+  const malformedThread = await startEnvironment({
+    id: "environment-malformed-thread",
+    label: "Malformed thread",
+    grants: new Map([["grant-malformed-thread", "token-malformed-thread"]]),
+    orchestration: {
+      thread: {
+        snapshotSequence: 1,
+        thread: { id: "thread-1" },
+      },
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    for (const [environment, grant] of [
+      [denied, "grant-denied"],
+      [malformed, "grant-malformed"],
+      [malformedThread, "grant-malformed-thread"],
+    ]) {
+      const paired = await client.callTool({
+        name: "add_environment",
+        arguments: { endpoint: environment.baseUrl, grant },
+      });
+      assert.equal(paired.isError, undefined);
+    }
+
+    const missingEnvironment = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "not-saved" },
+    });
+    assert.equal(content(missingEnvironment).error.code, "environment_not_found");
+
+    const missingThread = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-malformed", threadId: "missing" },
+    });
+    assert.equal(content(missingThread).error.code, "thread_not_found");
+
+    const deniedProjects = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "environment-denied" },
+    });
+    assert.equal(content(deniedProjects).error.code, "permission_denied");
+    assert.equal(JSON.stringify(deniedProjects).includes("private detail"), false);
+
+    const malformedProjects = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "environment-malformed" },
+    });
+    assert.equal(content(malformedProjects).error.code, "upstream_incompatible");
+
+    const malformedThreadResult = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-malformed-thread", threadId: "thread-1" },
+    });
+    assert.equal(content(malformedThreadResult).error.code, "upstream_incompatible");
+
+    denied.tokens.clear();
+    const expired = await client.callTool({
+      name: "list_projects",
+      arguments: { environmentId: "environment-denied" },
+    });
+    assert.equal(content(expired).error.code, "session_expired");
+  } finally {
+    await closeClient(client);
+    await denied.close();
+    await malformed.close();
+    await malformedThread.close();
     await rm(stateDirectory, { recursive: true, force: true });
   }
 });
