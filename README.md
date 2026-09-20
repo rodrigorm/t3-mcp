@@ -38,8 +38,8 @@ host-neutral and uses MCP tools rather than shell commands.
 ## Workflow
 
 1. Pair directly with an environment using `add_environment` and either a `pairingUrl` or an
-   `endpoint` plus `grant`. A pairing URL may carry its grant in the `#token=...` fragment. T3
-   Connect is not required.
+   `endpoint` plus `grant`. A pairing URL may carry its grant in a `?token=...` query or
+   `#token=...` fragment. T3 Connect is not required.
 2. Call `list_environments`, select an explicit environment `id`, then call `list_projects` with
    that id. Project and thread identifiers are scoped to the selected environment.
 3. Use `start_turn` with `environmentId`, `projectId`, and `prompt` for a new thread. Use
@@ -67,8 +67,8 @@ not part of this release chain.
 - `continue_turn`: `environmentId`, `threadId`, `prompt`.
 - `get_thread`: `environmentId`, `threadId`, and optional bounded `turnLimit`/`beforeCursor`.
 
-Pairing URL fragments use the upstream form `#token=...`. The response never includes the grant,
-access token, authenticated URL, or raw upstream error body.
+Pairing URLs use the upstream `?token=...` or `#token=...` form. The response never includes the
+grant, access token, authenticated URL, or raw upstream error body.
 
 Mutation acknowledgements are not replayed. A partial result keeps the created thread reference,
 and an ambiguous transport result is `unknown` so the caller can inspect the thread before retrying.
@@ -76,7 +76,9 @@ and an ambiguous transport result is `unknown` so the caller can inspect the thr
 ## Security
 
 - HTTPS is required except for loopback endpoints.
-- URL credentials and query parameters are rejected.
+- URL credentials and arbitrary query parameters are rejected. A pairing URL query may contain
+  only `token`, and the connector removes it before making requests. Endpoint URLs with an explicit
+  grant remain query-free.
 - Redirects are rejected, so credentials are never forwarded to another origin.
 - The registration file is outside the repository, owner-only, and atomically replaced.
 - A failed re-pair leaves the existing registration unchanged.

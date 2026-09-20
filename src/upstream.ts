@@ -220,10 +220,7 @@ function parseSession(value: unknown, accessTokenExpiresAt: string): string {
   ).toISOString();
 }
 
-export async function pairEnvironment(
-  endpoint: ValidatedEndpoint,
-  clientLabel = "t3-mcp",
-): Promise<PairingResult> {
+export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<PairingResult> {
   const descriptorResponse = await request(
     endpointPath(endpoint.baseUrl, "/.well-known/t3/environment"),
     { method: "GET" },
@@ -239,7 +236,7 @@ export async function pairEnvironment(
     subject_token_type: ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE,
     requested_token_type: ACCESS_TOKEN_TYPE,
     scope: REQUIRED_SCOPES.join(" "),
-    client_label: clientLabel,
+    client_label: "t3-mcp",
     client_device_type: "bot",
     client_os: process.platform,
   });

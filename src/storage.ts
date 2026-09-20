@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -31,6 +31,14 @@ function isPrivateMode(mode: number): boolean {
 
 function invalidStore(): ConnectorError {
   return new ConnectorError("storage_error", "Environment registrations are unavailable.");
+}
+
+function isInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return (
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
 }
 
 function isPairedEnvironment(value: unknown): value is PairedEnvironment {
@@ -69,7 +77,7 @@ export class EnvironmentStore {
       if (
         !file.isFile() ||
         file.isSymbolicLink() ||
-        (process.platform !== "win32" && !isPrivateMode(file.mode))
+        !isPrivateMode(file.mode)
       ) {
         throw invalidStore();
       }
@@ -121,9 +129,7 @@ export class EnvironmentStore {
       }
       await chmod(temporaryPath, 0o600);
       await rename(temporaryPath, this.filePath);
-      if (process.platform !== "win32") {
-        await chmod(this.filePath, 0o600);
-      }
+      await chmod(this.filePath, 0o600);
     } catch {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
       throw invalidStore();
@@ -132,14 +138,18 @@ export class EnvironmentStore {
 
   private async ensureDirectory(): Promise<void> {
     try {
+      if (isInside(path.resolve(process.cwd()), this.directory)) {
+        throw invalidStore();
+      }
       await mkdir(this.directory, { recursive: true, mode: 0o700 });
       const directory = await lstat(this.directory);
       if (!directory.isDirectory() || directory.isSymbolicLink()) {
         throw invalidStore();
       }
-      if (process.platform !== "win32") {
-        await chmod(this.directory, 0o700);
+      if (isInside(await realpath(process.cwd()), await realpath(this.directory))) {
+        throw invalidStore();
       }
+      await chmod(this.directory, 0o700);
     } catch {
       throw invalidStore();
     }

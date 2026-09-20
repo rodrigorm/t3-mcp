@@ -116,6 +116,28 @@ function cleanModelSelection(value: ModelSelection | undefined): ModelSelection 
   };
 }
 
+function threadTurnStartCommand(
+  commandId: string,
+  threadId: string,
+  prompt: string,
+  messageId = randomUUID(),
+) {
+  return {
+    type: "thread.turn.start",
+    commandId,
+    threadId,
+    message: {
+      messageId,
+      role: "user",
+      text: prompt,
+      attachments: [],
+    },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    createdAt: new Date().toISOString(),
+  };
+}
+
 function safeError(error: unknown): ConnectorError {
   return error instanceof ConnectorError
     ? error
@@ -162,7 +184,7 @@ export class EnvironmentConnector {
       throw new ConnectorError("environment_not_found", "The environment to re-pair is not saved.");
     }
 
-    const endpoint = parseEndpoint(inputUrl, input.grant);
+    const endpoint = parseEndpoint(inputUrl, input.grant, input.pairingUrl !== undefined);
     const paired = await pairEnvironment(endpoint);
     const environmentId = paired.descriptor.environmentId;
     const secrets = [endpoint.grant, paired.accessToken];
@@ -273,20 +295,10 @@ export class EnvironmentConnector {
     const turnCommandId = randomUUID();
     let turnSequence: number;
     try {
-      ({ sequence: turnSequence } = await dispatchCommand(environment, {
-        type: "thread.turn.start",
-        commandId: turnCommandId,
-        threadId,
-        message: {
-          messageId: randomUUID(),
-          role: "user",
-          text: prompt,
-          attachments: [],
-        },
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        createdAt: new Date().toISOString(),
-      }));
+      ({ sequence: turnSequence } = await dispatchCommand(
+        environment,
+        threadTurnStartCommand(turnCommandId, threadId, prompt),
+      ));
     } catch (error) {
       const failure = safeError(error);
       return {
@@ -357,20 +369,10 @@ export class EnvironmentConnector {
       messageId,
     };
     try {
-      const { sequence: turnSequence } = await dispatchCommand(environment, {
-        type: "thread.turn.start",
-        commandId: turnCommandId,
-        threadId,
-        message: {
-          messageId,
-          role: "user",
-          text: prompt,
-          attachments: [],
-        },
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        createdAt: new Date().toISOString(),
-      });
+      const { sequence: turnSequence } = await dispatchCommand(
+        environment,
+        threadTurnStartCommand(turnCommandId, threadId, prompt, messageId),
+      );
       return { ...continuation, outcome: "acknowledged", turnSequence };
     } catch (error) {
       const failure = safeError(error);

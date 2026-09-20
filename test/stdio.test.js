@@ -435,9 +435,43 @@ test("rejects insecure input and redirects without forwarding the grant", async 
     label: "Redirect",
     redirectTo: sink.baseUrl,
   });
+  const queryEnvironment = await startEnvironment({
+    id: "environment-query",
+    label: "Query",
+    grants: new Map([["query-grant", "query-access-token"]]),
+  });
   let client;
   try {
     client = await connectClient(stateDirectory);
+    const queryPair = await client.callTool({
+      name: "add_environment",
+      arguments: { pairingUrl: `${queryEnvironment.baseUrl}/pair?token=query-grant` },
+    });
+    assert.equal(queryPair.isError, undefined);
+    assert.equal(JSON.stringify(queryPair).includes("query-grant"), false);
+    assert.equal(JSON.stringify(queryPair).includes("query-access-token"), false);
+    assert.deepEqual(
+      queryEnvironment.requests.map((request) => request.path),
+      ["/.well-known/t3/environment", "/oauth/token", "/api/auth/session"],
+    );
+
+    const arbitraryQuery = await client.callTool({
+      name: "add_environment",
+      arguments: { pairingUrl: `${queryEnvironment.baseUrl}/pair?token=query-grant&extra=value` },
+    });
+    assert.equal(arbitraryQuery.isError, true);
+    assert.equal(content(arbitraryQuery).error.code, "insecure_endpoint");
+
+    const endpointQuery = await client.callTool({
+      name: "add_environment",
+      arguments: {
+        endpoint: `${queryEnvironment.baseUrl}/pair?token=query-grant`,
+        grant: "query-grant",
+      },
+    });
+    assert.equal(endpointQuery.isError, true);
+    assert.equal(content(endpointQuery).error.code, "insecure_endpoint");
+
     const insecure = await client.callTool({
       name: "add_environment",
       arguments: { endpoint: "http://example.com", grant: "never-send" },
@@ -467,8 +501,25 @@ test("rejects insecure input and redirects without forwarding the grant", async 
   } finally {
     await closeClient(client);
     await redirecting.close();
+    await queryEnvironment.close();
     await sink.close();
     await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects repository-local credential storage with a sanitized error", async () => {
+  let client;
+  try {
+    client = await connectClient(process.cwd());
+    const result = await client.callTool({ name: "list_environments", arguments: {} });
+    assert.equal(result.isError, true);
+    assert.deepEqual(content(result).error, {
+      code: "storage_error",
+      message: "Environment registrations are unavailable.",
+    });
+    assert.equal(JSON.stringify(result).includes(process.cwd()), false);
+  } finally {
+    await closeClient(client);
   }
 });
 

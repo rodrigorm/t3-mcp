@@ -30,6 +30,7 @@ test("runs the packed package through the public MCP seam", { timeout: 120_000 }
       ).stdout,
     )[0];
     const packedFiles = packed.files.map(({ path: filePath }) => filePath.replace(/^package\//, ""));
+    assert.ok(packedFiles.includes("dist/index.js"));
     assert.deepEqual(
       packedFiles.filter((filePath) => filePath.startsWith("skills/") && filePath.endsWith("SKILL.md")),
       ["skills/t3-run-turn/SKILL.md"],

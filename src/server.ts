@@ -175,7 +175,7 @@ function errorResult(error: unknown) {
   return textResult(structuredContent, true);
 }
 
-async function run<T>(operation: () => Promise<T>, build: (value: T) => Record<string, unknown>) {
+async function runTool<T>(operation: () => Promise<T>, build: (value: T) => Record<string, unknown>) {
   try {
     return textResult(build(await operation()));
   } catch (error) {
@@ -195,7 +195,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
     },
     async (input: AddInput) =>
-      run(
+      runTool(
         () => connector.addEnvironment(input satisfies AddEnvironmentInput),
         (environment) => ({ environment }),
       ),
@@ -208,7 +208,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       outputSchema: listResultSchema,
       annotations: { destructiveHint: false, idempotentHint: true, readOnlyHint: true },
     },
-    async () => run(() => connector.listEnvironments(), (environments) => ({ environments })),
+    async () => runTool(() => connector.listEnvironments(), (environments) => ({ environments })),
   );
   server.registerTool(
     "list_projects",
@@ -219,7 +219,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       annotations: { destructiveHint: false, idempotentHint: true, readOnlyHint: true },
     },
     async (input: EnvironmentIdInput) =>
-      run(
+      runTool(
         () => connector.listProjects(input.environmentId),
         (projects) => ({ environmentId: input.environmentId, projects }),
       ),
@@ -234,7 +234,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
     },
     async (input: StartTurnToolInput) =>
-      run(
+      runTool(
         () => connector.startTurn(input satisfies ConnectorStartTurnInput),
         (start) => ({ start }),
       ),
@@ -248,7 +248,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
     },
     async (input: ContinueTurnToolInput) =>
-      run(
+      runTool(
         () => connector.continueTurn(input satisfies ConnectorContinueTurnInput),
         (continuation) => ({ continuation }),
       ),
@@ -263,7 +263,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       annotations: { destructiveHint: false, idempotentHint: true, readOnlyHint: true },
     },
     async (input: GetThreadInput) =>
-      run(
+      runTool(
         () => connector.getThread(input satisfies GetThreadInput),
         (thread) => ({ thread }),
       ),

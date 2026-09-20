@@ -13,7 +13,8 @@ private bot convention, or require T3 Connect.
 These are the six tools exposed by the connector. Use their MCP schemas as the source of truth.
 
 - `add_environment`: `pairingUrl?`, `endpoint?`, `grant?`, `label?`, `environmentId?`. Provide a
-  pairing URL or an endpoint; an endpoint needs `grant` unless the grant is in the URL fragment.
+  pairing URL or an endpoint; a pairing URL may carry its grant in the URL query or fragment, while
+  an endpoint needs `grant` unless the grant is in the URL fragment.
   Set `environmentId` only when explicitly re-pairing a saved environment.
 - `list_environments`: no arguments. Use the returned environment `id` for every environment,
   project, and thread operation.

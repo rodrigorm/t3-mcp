@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test test",
     "check": "npm run typecheck && npm test"

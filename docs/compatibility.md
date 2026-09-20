@@ -18,6 +18,10 @@ The connector implements the direct environment contract evidenced by T3 Code co
 4. Require a bearer access token and both orchestration scopes.
 5. Validate the token with `GET /api/auth/session` and retain its reported expiry.
 
+Pairing URLs may carry the one-time grant as exactly one `token` query parameter or as exactly one
+`token` fragment parameter. Arbitrary query parameters are rejected, endpoint URLs supplied with an
+explicit grant remain query-free, and accepted grants are stripped before any request is sent.
+
 The upstream pairing grant is exchanged for a short-lived environment session. It is not
 stored after the exchange. The bearer session is stored privately for later workflow slices.
 DPoP is not requested because this connector does not implement DPoP proof keys.
@@ -65,9 +69,11 @@ creation time. It does not create a thread, fork the request, or submit an appro
 The upstream dispatch result remains authoritative if the thread changes after observation. Known
 busy, approval, authorization, missing-thread, and conflict responses become sanitized structured
 errors. A lost or invalid acknowledgement is `unknown` with the thread, command, and message
-identifiers; the connector never replays the command. The upstream command contract has no client
-precondition for an expected snapshot sequence, so an acknowledgement means acceptance only and
-does not promise exactly-once execution or completion.
+identifiers; the connector never replays the command. The pinned upstream `thread.turn.start`
+contract has no client precondition for an expected snapshot sequence, so two concurrent calls can
+both pass the advisory read. An acknowledgement means acceptance only and does not promise
+exactly-once execution or completion; the connector does not fabricate a precondition or silently
+queue a call.
 
 ## Support statement
 
@@ -85,7 +91,7 @@ servers implementing this contract. They cover descriptor and token exchange, in
 restart persistence, failed replacement, two-environment registration isolation, project discovery,
 thread status mapping, bounded pagination, first-turn and continuation acknowledgement/failure handling,
 same-thread retrieval, malformed
-and insecure URLs, redaction, owner-only storage, and redirect rejection.
+and insecure URLs, redaction, owner-only storage on all supported platforms, and redirect rejection.
 
 A live direct-pairing smoke check against a real T3 environment without Connect was not run for this
 release because this workspace has no operator-provided environment endpoint and grant. No live

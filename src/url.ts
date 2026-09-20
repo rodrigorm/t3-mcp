@@ -20,17 +20,45 @@ function isLoopback(hostname: string): boolean {
   return false;
 }
 
+function readGrantFromParameters(
+  params: URLSearchParams,
+  source: "fragment" | "query",
+): string | undefined {
+  const entries = Array.from(params.entries());
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  const grant = entries.length === 1 && entries[0][0] === "token" ? entries[0][1].trim() : "";
+  if (!grant) {
+    throw new ConnectorError(
+      source === "query" ? "insecure_endpoint" : "invalid_input",
+      source === "query"
+        ? "Pairing URL query parameters must contain only token."
+        : "The pairing URL fragment must contain only token.",
+    );
+  }
+  return grant;
+}
+
 function readGrantFromFragment(url: URL): string | undefined {
   if (url.hash.length === 0) {
     return undefined;
   }
+  return readGrantFromParameters(new URLSearchParams(url.hash.slice(1)), "fragment");
+}
 
-  const params = new URLSearchParams(url.hash.slice(1));
-  const grant = params.get("token")?.trim();
-  if (!grant || Array.from(params.keys()).some((key) => key !== "token")) {
-    throw new ConnectorError("invalid_input", "The pairing URL fragment must contain only token.");
+function readGrantFromQuery(url: URL, allowQueryGrant: boolean): string | undefined {
+  if (url.search.length === 0) {
+    return undefined;
   }
-  return grant;
+  if (!allowQueryGrant) {
+    throw new ConnectorError(
+      "insecure_endpoint",
+      "Endpoint credentials and query parameters are not accepted.",
+    );
+  }
+  return readGrantFromParameters(url.searchParams, "query");
 }
 
 function withoutPairPath(pathname: string): string {
@@ -41,7 +69,11 @@ function withoutPairPath(pathname: string): string {
   return `${normalized || ""}/`.replace(/^$/, "/");
 }
 
-export function parseEndpoint(input: string, explicitGrant?: string): ValidatedEndpoint {
+export function parseEndpoint(
+  input: string,
+  explicitGrant?: string,
+  allowQueryGrant = false,
+): ValidatedEndpoint {
   let url: URL;
   try {
     url = new URL(input.trim());
@@ -52,7 +84,7 @@ export function parseEndpoint(input: string, explicitGrant?: string): ValidatedE
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new ConnectorError("invalid_input", "Endpoint must use HTTP or HTTPS.");
   }
-  if (url.username || url.password || url.search) {
+  if (url.username || url.password) {
     throw new ConnectorError(
       "insecure_endpoint",
       "Endpoint credentials and query parameters are not accepted.",
@@ -65,16 +97,22 @@ export function parseEndpoint(input: string, explicitGrant?: string): ValidatedE
     );
   }
 
+  const queryGrant = readGrantFromQuery(url, allowQueryGrant);
   const fragmentGrant = readGrantFromFragment(url);
-  const grant = explicitGrant?.trim() || fragmentGrant;
+  if (queryGrant && fragmentGrant && queryGrant !== fragmentGrant) {
+    throw new ConnectorError("invalid_input", "The pairing URL grants do not match.");
+  }
+  const urlGrant = queryGrant || fragmentGrant;
+  const grant = explicitGrant?.trim() || urlGrant;
   if (!grant) {
     throw new ConnectorError("missing_grant", "A pairing grant is required.");
   }
-  if (explicitGrant?.trim() && fragmentGrant && explicitGrant.trim() !== fragmentGrant) {
+  if (explicitGrant?.trim() && urlGrant && explicitGrant.trim() !== urlGrant) {
     throw new ConnectorError("invalid_input", "The pairing URL and grant do not match.");
   }
 
   url.pathname = withoutPairPath(url.pathname);
+  url.search = "";
   url.hash = "";
   return { baseUrl: url, grant };
 }
