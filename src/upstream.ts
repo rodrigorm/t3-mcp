@@ -1,4 +1,5 @@
 import { ConnectorError } from "./errors.js";
+import { createDpopProof } from "./dpop.js";
 import { endpointPath, publicEndpoint, type ValidatedEndpoint } from "./url.js";
 import {
   REQUIRED_SCOPES,
@@ -13,6 +14,7 @@ import {
   type PublicThreadMessage,
   type PublicThreadStatus,
   type ModelSelection,
+  type DpopPrivateJwk,
 } from "./types.js";
 
 const TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -186,6 +188,28 @@ async function request(
   return response;
 }
 
+async function environmentHeaders(
+  environment: PairedEnvironment,
+  method: string,
+  url: URL,
+): Promise<Record<string, string>> {
+  if (environment.tokenType === "Bearer") {
+    return { authorization: `Bearer ${environment.accessToken}` };
+  }
+  if (!environment.dpopPrivateJwk) {
+    throw new ConnectorError("upstream_incompatible", "The saved environment proof key is invalid.");
+  }
+  return {
+    authorization: `DPoP ${environment.accessToken}`,
+    dpop: createDpopProof({
+      key: environment.dpopPrivateJwk,
+      method,
+      url: url.toString(),
+      accessToken: environment.accessToken,
+    }),
+  };
+}
+
 async function json(response: Response, code: ConnectorErrorCodeForResponse): Promise<unknown> {
   try {
     return await response.json();
@@ -196,7 +220,11 @@ async function json(response: Response, code: ConnectorErrorCodeForResponse): Pr
 
 type ConnectorErrorCodeForResponse = "upstream_incompatible" | "pairing_rejected";
 
-function parseSession(value: unknown, accessTokenExpiresAt: string): string {
+function parseSession(
+  value: unknown,
+  accessTokenExpiresAt: string,
+  tokenType: "Bearer" | "DPoP",
+): string {
   if (!isRecord(value) || value.authenticated !== true) {
     throw new ConnectorError("pairing_rejected", "The environment did not establish a session.");
   }
@@ -204,7 +232,8 @@ function parseSession(value: unknown, accessTokenExpiresAt: string): string {
   if (
     !Array.isArray(scopes) ||
     !REQUIRED_SCOPES.every((scope) => scopes.includes(scope)) ||
-    value.sessionMethod !== "bearer-access-token"
+    value.sessionMethod !==
+      (tokenType === "DPoP" ? "dpop-access-token" : "bearer-access-token")
   ) {
     throw new ConnectorError(
       "upstream_incompatible",
@@ -220,7 +249,10 @@ function parseSession(value: unknown, accessTokenExpiresAt: string): string {
   ).toISOString();
 }
 
-export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<PairingResult> {
+async function pairWithGrant(
+  endpoint: ValidatedEndpoint,
+  proofKey?: DpopPrivateJwk,
+): Promise<PairingResult> {
   const descriptorResponse = await request(
     endpointPath(endpoint.baseUrl, "/.well-known/t3/environment"),
     { method: "GET" },
@@ -230,6 +262,7 @@ export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<Pair
     await json(descriptorResponse, "upstream_incompatible"),
   );
 
+  const tokenType = proofKey ? "DPoP" : "Bearer";
   const body = new URLSearchParams({
     grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
     subject_token: endpoint.grant,
@@ -244,7 +277,18 @@ export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<Pair
     endpointPath(endpoint.baseUrl, "/oauth/token"),
     {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        ...(proofKey
+          ? {
+              dpop: createDpopProof({
+                key: proofKey,
+                method: "POST",
+                url: endpointPath(endpoint.baseUrl, "/oauth/token").toString(),
+              }),
+            }
+          : {}),
+      },
       body,
     },
     "pairing",
@@ -253,7 +297,7 @@ export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<Pair
   if (
     !isRecord(token) ||
     !requiredString(token.access_token) ||
-    token.token_type !== "Bearer" ||
+    token.token_type !== tokenType ||
     token.issued_token_type !== ACCESS_TOKEN_TYPE ||
     typeof token.expires_in !== "number" ||
     !Number.isFinite(token.expires_in) ||
@@ -273,19 +317,52 @@ export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<Pair
 
   const sessionResponse = await request(
     endpointPath(endpoint.baseUrl, "/api/auth/session"),
-    { method: "GET", headers: { authorization: `Bearer ${token.access_token}` } },
+    {
+      method: "GET",
+      headers: proofKey
+        ? await environmentHeaders(
+            {
+              environmentId: descriptor.environmentId,
+              label: descriptor.label,
+              endpoint: publicEndpoint(endpoint.baseUrl),
+              serverVersion: descriptor.serverVersion,
+              orchestrationProtocolVersion: descriptor.orchestrationProtocolVersion,
+              scopes: REQUIRED_SCOPES,
+              sessionExpiresAt: accessTokenExpiresAt,
+              pairedAt: new Date().toISOString(),
+              accessToken: token.access_token,
+              tokenType: "DPoP",
+              dpopPrivateJwk: proofKey,
+            },
+            "GET",
+            endpointPath(endpoint.baseUrl, "/api/auth/session"),
+          )
+        : { authorization: `Bearer ${token.access_token}` },
+    },
     "session",
   );
   const session = await json(sessionResponse, "upstream_incompatible");
-  const sessionExpiresAt = parseSession(session, accessTokenExpiresAt);
+  const sessionExpiresAt = parseSession(session, accessTokenExpiresAt, tokenType);
 
   return {
     descriptor,
     accessToken: token.access_token,
     sessionExpiresAt,
     scopes: REQUIRED_SCOPES,
-    tokenType: "Bearer",
+    tokenType,
+    ...(proofKey ? { dpopPrivateJwk: proofKey } : {}),
   };
+}
+
+export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<PairingResult> {
+  return pairWithGrant(endpoint);
+}
+
+export async function pairConnectEnvironment(
+  endpoint: ValidatedEndpoint,
+  proofKey: DpopPrivateJwk,
+): Promise<PairingResult> {
+  return pairWithGrant(endpoint, proofKey);
 }
 
 function invalidOrchestration(message: string): never {
@@ -593,9 +670,10 @@ function parseThread(
 }
 
 async function readProjectSnapshot(environment: PairedEnvironment): Promise<readonly ParsedProject[]> {
+  const url = endpointPath(new URL(environment.endpoint), "/api/orchestration/snapshot");
   const response = await request(
-    endpointPath(new URL(environment.endpoint), "/api/orchestration/snapshot"),
-    { method: "GET", headers: { authorization: `${environment.tokenType} ${environment.accessToken}` } },
+    url,
+    { method: "GET", headers: await environmentHeaders(environment, "GET", url) },
     "projects",
   );
   return parseProjects(await json(response, "upstream_incompatible"));
@@ -633,7 +711,7 @@ export async function getThread(
   if (beforeCursor !== undefined) url.searchParams.set("beforeCursor", beforeCursor);
   const response = await request(
     url,
-    { method: "GET", headers: { authorization: `${environment.tokenType} ${environment.accessToken}` } },
+    { method: "GET", headers: await environmentHeaders(environment, "GET", url) },
     "thread",
   );
   return parseThread(await json(response, "upstream_incompatible"), environment.environmentId, threadId, turnLimit);
@@ -647,12 +725,13 @@ export async function dispatchCommand(
   environment: PairedEnvironment,
   command: Record<string, unknown>,
 ): Promise<DispatchAcknowledgement> {
+  const url = endpointPath(new URL(environment.endpoint), "/api/orchestration/dispatch");
   const response = await request(
-    endpointPath(new URL(environment.endpoint), "/api/orchestration/dispatch"),
+    url,
     {
       method: "POST",
       headers: {
-        authorization: `${environment.tokenType} ${environment.accessToken}`,
+        ...(await environmentHeaders(environment, "POST", url)),
         "content-type": "application/json",
       },
       body: JSON.stringify(command),

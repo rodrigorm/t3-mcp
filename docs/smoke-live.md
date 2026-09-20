@@ -1,12 +1,13 @@
 # Live Smoke
 
-This smoke uses direct pairing against the local T3 Desktop/server. It does not use T3 Connect.
-Pairing output and state contain credentials; keep both outside the repository and never paste them
-into logs, issues, or commits.
+The default smoke uses direct pairing against the local T3 Desktop/server. An optional Connect smoke
+can use the same MCP client after operator authentication. Pairing output, Connect state, and OAuth
+configuration contain credentials; keep them outside the repository and never paste them into logs,
+issues, or commits.
 
 ## Prepare
 
-Run from the repository checkout on `feat/t3-mcp-mvp`:
+Run from the repository checkout on the feature branch:
 
 ```sh
 npm run build
@@ -81,3 +82,52 @@ Each step reports `outcome=accepted`, `outcome=approval_required`, or `outcome=u
 `unknown` mutation is never replayed; inspect the reported thread in T3 Code first. If a thread
 reports `approval_required` or `input_required`, resolve it in T3 Code and observe it again before
 deciding whether any later action is safe.
+
+## Connect Smoke
+
+The Connect path needs an operator-authorized Connect account and a selected environment. Configure the
+relay, OAuth token endpoint, and client id in the MCP process environment using
+`T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_TOKEN_ENDPOINT`, and `T3_MCP_CONNECT_CLIENT_ID` (or the
+documented aliases). Do not put these values in the repository.
+
+Through an MCP client, run this sequence:
+
+1. Call `connect_authenticate` with `action=start` and open the returned `authorizationUrl`.
+2. Complete the browser flow, then poll `connect_authenticate` with `action=status` until it reports
+   `authenticated`.
+3. Call `list_connect_environments` and record the selected environment id without saving any other
+   environment.
+4. Call `register_connect_environment` for a new registration, or
+   `attach_connect_environment` for a previously direct-paired registration.
+5. Call `list_environments`, `list_projects`, and one non-destructive observation such as
+   `get_thread`; confirm no token or DPoP key appears in results or logs.
+6. Call `sign_out_connect`, confirm Connect discovery is rejected while the saved environment session
+   remains usable, then call `unregister_environment` and confirm the registration is gone after a
+   process restart.
+
+This manual Connect sequence was not run for this release because no operator-authorized account or
+remote environment was provided.
+
+## Connect Smoke
+
+The Connect path needs an operator-authorized Connect account and a selected environment. Configure the
+relay, OAuth token endpoint, and client id in the MCP process environment using
+`T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_TOKEN_ENDPOINT`, and `T3_MCP_CONNECT_CLIENT_ID` (or the
+documented aliases). Do not put these values in the repository.
+
+Through an MCP client, run this sequence:
+
+1. Call `connect_authenticate` with `action=start` and open the returned `authorizationUrl`.
+2. Complete the browser flow, then poll `connect_authenticate` with `action=status` until it reports
+   `authenticated`.
+3. Call `list_connect_environments` and select one environment id without saving any other environment.
+4. Call `register_connect_environment` for a new registration, or
+   `attach_connect_environment` for a previously direct-paired registration.
+5. Call `list_environments`, `list_projects`, and one non-destructive observation such as
+   `get_thread`; confirm no token or DPoP key appears in results or logs.
+6. Call `sign_out_connect`, confirm Connect discovery is rejected while a valid saved environment
+   session remains usable, then call `unregister_environment` and confirm the registration is gone after
+   a process restart.
+
+This manual Connect sequence was not run for this release because no operator-authorized account or
+remote environment was provided.

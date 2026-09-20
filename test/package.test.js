@@ -55,11 +55,17 @@ test("runs the packed package through the public MCP seam", { timeout: 120_000 }
     const skill = await readFile(path.join(packageRoot, "skills", "t3-run-turn", "SKILL.md"), "utf8");
     for (const toolName of [
       "add_environment",
+      "attach_connect_environment",
+      "connect_authenticate",
       "list_environments",
+      "list_connect_environments",
       "list_projects",
+      "register_connect_environment",
+      "sign_out_connect",
       "start_turn",
       "continue_turn",
       "get_thread",
+      "unregister_environment",
     ]) {
       assert.match(skill, new RegExp(`\\b${toolName}\\b`));
     }
@@ -77,11 +83,17 @@ test("runs the packed package through the public MCP seam", { timeout: 120_000 }
     const tools = await client.listTools();
     const expectedArguments = {
       add_environment: ["endpoint", "environmentId", "grant", "label", "pairingUrl"],
+      attach_connect_environment: ["environmentId", "label", "targetEnvironmentId"],
+      connect_authenticate: ["action"],
       continue_turn: ["environmentId", "prompt", "threadId"],
       get_thread: ["beforeCursor", "environmentId", "threadId", "turnLimit"],
+      list_connect_environments: [],
       list_environments: [],
       list_projects: ["environmentId"],
+      register_connect_environment: ["environmentId", "label"],
+      sign_out_connect: [],
       start_turn: ["environmentId", "modelSelection", "projectId", "prompt"],
+      unregister_environment: ["environmentId"],
     };
     assert.deepEqual(
       tools.tools.map((tool) => tool.name).sort(),

@@ -15,20 +15,38 @@ The connector implements the direct environment contract evidenced by T3 Code co
    - `requested_token_type=urn:ietf:params:oauth:token-type:access_token`
    - `scope=orchestration:read orchestration:operate`
 
-4. Require a bearer access token and both orchestration scopes.
+4. Require a bearer access token and both orchestration scopes for direct pairing.
 5. Validate the token with `GET /api/auth/session` and retain its reported expiry.
 
 Pairing URLs may carry the one-time grant as exactly one `token` query parameter or as exactly one
 `token` fragment parameter. Arbitrary query parameters are rejected, endpoint URLs supplied with an
 explicit grant remain query-free, and accepted grants are stripped before any request is sent.
 
-The upstream pairing grant is exchanged for a short-lived environment session. It is not
-stored after the exchange. The bearer session is stored privately for later workflow slices.
-DPoP is not requested because this connector does not implement DPoP proof keys.
+The upstream pairing grant is exchanged for a short-lived environment session. It is not stored after
+the exchange. The bearer session is stored privately for later workflow slices.
+
+## T3 Connect Contract
+
+Connect is optional and does not replace direct pairing. `connect_authenticate` starts a local callback
+flow using the configured Clerk OAuth token endpoint and a PKCE verifier; the browser authorization URL
+and status are public, while tokens and the DPoP private key remain in the separate owner-only Connect
+state file.
+
+After authentication, `list_connect_environments` uses the Connect relay for discovery only. The
+connector never saves a discovered environment implicitly. `register_connect_environment` or
+`attach_connect_environment` explicitly selects an environment, requests a relay DPoP-bound credential,
+and exchanges that credential at the environment's `/oauth/token` endpoint with a DPoP proof key.
+Connect environment requests use the resulting DPoP access token and proof; direct environment requests
+continue to use bearer access tokens.
+
+The selected environment identifier is checked against both the relay response and the environment
+descriptor before state is written. `sign_out_connect` clears only Connect authentication, while saved
+environment sessions remain available when valid. `unregister_environment` removes the saved
+environment and all of its stored access paths.
 
 ## Orchestration Read Contract
 
-1. Read `GET /api/orchestration/snapshot` with the saved bearer session and map active upstream
+1. Read `GET /api/orchestration/snapshot` with the saved environment session and map active upstream
    projects' `id` and `title` to public `id` and `name` values.
 2. Read `GET /api/orchestration/threads/:threadId` with `turnLimit` and optional `beforeCursor`
    query parameters. The upstream `page.beforeCursor` is returned as `nextCursor`; `hasMore` is
@@ -78,21 +96,23 @@ queue a call.
 ## Support statement
 
 The supported upstream contract is T3 Code's direct environment and orchestration protocol version
-`1`, evidenced by upstream commit `7445aa733ada33e45289e5aa5055f79142556513`. The automated fixture
-advertises server version `0.0.42` and implements that contract; the public MCP tests exercise
-pairing, discovery, dispatch, observation, pagination, authorization failures, and ambiguous
-mutation outcomes against it. This is tested protocol compatibility, not a claim that the fixture's
-server version is a currently deployed T3 release.
+`1`, plus the optional Connect relay contract evidenced by upstream commit
+`7445aa733ada33e45289e5aa5055f79142556513`. The automated fixtures advertise server version `0.0.42`
+and implement those contracts; the public MCP tests exercise pairing, Connect authentication and
+discovery, explicit registration and attachment, sign-out, unregistration, dispatch, observation,
+pagination, authorization failures, and ambiguous mutation outcomes. This is tested protocol
+compatibility, not a claim that the fixture's server version is a currently deployed T3 release.
 
 ## Verification
 
 The automated tests run an actual MCP client against the stdio connector and controlled HTTP
-servers implementing this contract. They cover descriptor and token exchange, invalid grants,
-restart persistence, failed replacement, two-environment registration isolation, project discovery,
-thread status mapping, bounded pagination, first-turn and continuation acknowledgement/failure handling,
-same-thread retrieval, malformed
-and insecure URLs, redaction, owner-only storage on all supported platforms, and redirect rejection.
+servers implementing the direct and Connect contracts. They cover descriptor and token exchange, invalid
+grants, restart persistence, failed replacement, Connect discovery without implicit registration,
+explicit registration and attachment, DPoP environment requests, sign-out, unregistration, two-environment
+registration isolation, project discovery, thread status mapping, bounded pagination, first-turn and
+continuation acknowledgement/failure handling, same-thread retrieval, malformed and insecure URLs,
+redaction, owner-only storage on all supported platforms, and redirect rejection.
 
-A live direct-pairing smoke check against a real T3 environment without Connect was not run for this
-release because this workspace has no operator-provided environment endpoint and grant. No live
-pair, list, start, retrieve, continue, retrieve result is claimed.
+A live direct-pairing or Connect smoke check against a real T3 environment was not run for this release
+because this workspace has no operator-authorized environment endpoint, grant, or Connect account. No
+live pair, Connect registration, list, start, retrieve, continue, or retrieve result is claimed.

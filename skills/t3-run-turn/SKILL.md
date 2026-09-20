@@ -5,12 +5,14 @@ description: Run and observe T3 Code turns through the generic t3-mcp MCP tools.
 
 # t3-run-turn
 
-Use the `t3-mcp` MCP server for the complete workflow. Do not invoke a local turn CLI, assume a
-private bot convention, or require T3 Connect.
+Use the `t3-mcp` MCP server for the complete workflow. Do not invoke a local turn CLI or assume a
+private bot convention. Direct pairing is always available; T3 Connect is an optional operator-driven
+path.
 
 ## Tools
 
-These are the six tools exposed by the connector. Use their MCP schemas as the source of truth.
+The connector exposes the six direct workflow tools plus optional T3 Connect tools. Use their MCP
+schemas as the source of truth.
 
 - `add_environment`: `pairingUrl?`, `endpoint?`, `grant?`, `label?`, `environmentId?`. Provide a
   pairing URL or an endpoint; a pairing URL may carry its grant in the URL query or fragment, while
@@ -24,6 +26,18 @@ These are the six tools exposed by the connector. Use their MCP schemas as the s
   `value`.
 - `continue_turn`: `environmentId`, `threadId`, `prompt`.
 - `get_thread`: `environmentId`, `threadId`, and optional `turnLimit` and `beforeCursor`.
+- `connect_authenticate`: optional `action` of `start`, `status`, or `cancel`. Start the browser
+  flow and complete it in the returned URL; credentials are never returned by the tool.
+- `list_connect_environments`: no arguments. This discovers environments without saving or selecting
+  one.
+- `register_connect_environment`: `environmentId` and optional `label`. Explicitly save one discovered
+  Connect environment.
+- `attach_connect_environment`: `environmentId`, `targetEnvironmentId`, and optional `label`. Use
+  this only to attach Connect access to an existing saved registration after identity matching.
+- `sign_out_connect`: no arguments. This removes only Connect authentication; saved environment
+  sessions remain available when valid.
+- `unregister_environment`: `environmentId`. Remove one saved registration and its stored access
+  paths.
 
 ## Run a turn
 
@@ -45,4 +59,5 @@ These are the six tools exposed by the connector. Use their MCP schemas as the s
    deliberate decision that the requested work was not accepted.
 
 Normal adopted workflows use MCP for turns. A local turn CLI can be used by a host for debugging,
-but it is not a package dependency and is not part of this workflow.
+but it is not a package dependency and is not part of this workflow. Connect discovery never implies
+registration; select an environment explicitly, then register or attach it before using turn tools.

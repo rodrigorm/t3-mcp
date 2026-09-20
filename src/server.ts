@@ -4,7 +4,10 @@ import { z } from "zod";
 import {
   EnvironmentConnector,
   type AddEnvironmentInput,
+  type AttachConnectEnvironmentInput,
+  type ConnectAuthInput,
   type ContinueTurnInput as ConnectorContinueTurnInput,
+  type RegisterConnectEnvironmentInput,
   type StartTurnInput as ConnectorStartTurnInput,
 } from "./connector.js";
 import { ConnectorError } from "./errors.js";
@@ -19,10 +22,34 @@ const environmentSchema = z.object({
   scopes: z.array(z.string()),
   sessionExpiresAt: z.string(),
   pairedAt: z.string(),
+  source: z.enum(["direct", "connect"]).optional(),
+  connectAttached: z.boolean().optional(),
 });
 const errorSchema = z.object({ code: z.string(), message: z.string() });
 const addResultSchema = z.object({
   environment: environmentSchema.optional(),
+  error: errorSchema.optional(),
+});
+const connectAuthSchema = z.object({
+  status: z.enum(["signed_out", "pending", "authenticated", "failed", "cancelled"]),
+  authorizationUrl: z.string().optional(),
+  expiresAt: z.string().optional(),
+  error: errorSchema.optional(),
+});
+const connectAuthResultSchema = z.object({ authentication: connectAuthSchema });
+const connectEnvironmentSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  endpoint: z.string(),
+  linkedAt: z.string(),
+});
+const connectEnvironmentListResultSchema = z.object({
+  environments: z.array(connectEnvironmentSchema).optional(),
+  error: errorSchema.optional(),
+});
+const unregisterResultSchema = z.object({
+  environmentId: z.string().optional(),
+  unregistered: z.literal(true).optional(),
   error: errorSchema.optional(),
 });
 const listResultSchema = z.object({
@@ -122,7 +149,23 @@ const addInputSchema = z.object({
   environmentId: z.string().trim().min(1).max(512).optional(),
 });
 
+const connectAuthInputSchema = z.object({
+  action: z.enum(["start", "status", "cancel"]).optional(),
+});
+const registerConnectInputSchema = z.object({
+  environmentId: z.string().trim().min(1).max(512),
+  label: z.string().trim().min(1).max(200).optional(),
+});
+const attachConnectInputSchema = z.object({
+  environmentId: z.string().trim().min(1).max(512),
+  targetEnvironmentId: z.string().trim().min(1).max(512),
+  label: z.string().trim().min(1).max(200).optional(),
+});
+
 type AddInput = z.infer<typeof addInputSchema>;
+type ConnectAuthToolInput = z.infer<typeof connectAuthInputSchema>;
+type RegisterConnectToolInput = z.infer<typeof registerConnectInputSchema>;
+type AttachConnectToolInput = z.infer<typeof attachConnectInputSchema>;
 const environmentIdInputSchema = z.object({
   environmentId: z.string().trim().min(1).max(512),
 });
@@ -199,6 +242,84 @@ export function createServer(connector: EnvironmentConnector): McpServer {
         () => connector.addEnvironment(input satisfies AddEnvironmentInput),
         (environment) => ({ environment }),
       ),
+  );
+  server.registerTool(
+    "connect_authenticate",
+    {
+      description:
+        "Start, inspect, or cancel operator-driven T3 Connect browser authentication without returning credentials.",
+      inputSchema: connectAuthInputSchema,
+      outputSchema: connectAuthResultSchema,
+      annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
+    },
+    async (input: ConnectAuthToolInput) =>
+      runTool(
+        () => connector.connectAuth(input satisfies ConnectAuthInput),
+        (authentication) => ({ authentication }),
+      ),
+  );
+  server.registerTool(
+    "list_connect_environments",
+    {
+      description: "List environments available through T3 Connect without saving or selecting them.",
+      inputSchema: z.object({}),
+      outputSchema: connectEnvironmentListResultSchema,
+      annotations: { destructiveHint: false, idempotentHint: true, readOnlyHint: true },
+    },
+    async () => runTool(() => connector.listConnectEnvironments(), (environments) => ({ environments })),
+  );
+  server.registerTool(
+    "register_connect_environment",
+    {
+      description:
+        "Explicitly register one selected T3 Connect environment and obtain its environment-issued session.",
+      inputSchema: registerConnectInputSchema,
+      outputSchema: addResultSchema,
+      annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
+    },
+    async (input: RegisterConnectToolInput) =>
+      runTool(
+        () => connector.registerConnectEnvironment(input satisfies RegisterConnectEnvironmentInput),
+        (environment) => ({ environment }),
+      ),
+  );
+  server.registerTool(
+    "attach_connect_environment",
+    {
+      description:
+        "Explicitly attach Connect access to a saved registration after its environment identity matches.",
+      inputSchema: attachConnectInputSchema,
+      outputSchema: addResultSchema,
+      annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
+    },
+    async (input: AttachConnectToolInput) =>
+      runTool(
+        () => connector.attachConnectEnvironment(input satisfies AttachConnectEnvironmentInput),
+        (environment) => ({ environment }),
+      ),
+  );
+  server.registerTool(
+    "sign_out_connect",
+    {
+      description:
+        "Sign out of T3 Connect without removing saved environments or their environment sessions.",
+      inputSchema: z.object({}),
+      outputSchema: z.object({ signedOut: z.boolean(), error: errorSchema.optional() }),
+      annotations: { destructiveHint: false, idempotentHint: true, readOnlyHint: false },
+    },
+    async () => runTool(() => connector.signOutConnect(), (result) => result),
+  );
+  server.registerTool(
+    "unregister_environment",
+    {
+      description:
+        "Remove one saved environment and its locally retained access; this does not revoke its upstream session.",
+      inputSchema: environmentIdInputSchema,
+      outputSchema: unregisterResultSchema,
+      annotations: { destructiveHint: true, idempotentHint: false, readOnlyHint: false },
+    },
+    async (input: EnvironmentIdInput) =>
+      runTool(() => connector.unregisterEnvironment(input.environmentId), (result) => result),
   );
   server.registerTool(
     "list_environments",
