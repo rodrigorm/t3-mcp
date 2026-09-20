@@ -213,13 +213,13 @@ function content(result) {
 
 const NOW = "2026-09-20T00:00:00.000Z";
 
-function message(id, role, text) {
+function message(id, role, text, turnId = "turn-1") {
   return {
     id,
     role,
     text,
     attachments: [],
-    turnId: "turn-1",
+    turnId,
     streaming: false,
     createdAt: NOW,
     updatedAt: NOW,
@@ -319,7 +319,14 @@ test("pairs, persists, re-pairs safely, and lists through the public MCP seam", 
     const tools = await client.listTools();
     assert.deepEqual(
       tools.tools.map((tool) => tool.name).sort(),
-      ["add_environment", "get_thread", "list_environments", "list_projects", "start_turn"],
+      [
+        "add_environment",
+        "continue_turn",
+        "get_thread",
+        "list_environments",
+        "list_projects",
+        "start_turn",
+      ],
     );
     assert.ok(tools.tools.find((tool) => tool.name === "add_environment").inputSchema.properties.pairingUrl);
 
@@ -606,6 +613,8 @@ test("starts a turn through acknowledged dispatch and observes running and compl
   const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-start-"));
   let startedThreadId;
   let completed = false;
+  let continuationStarted = false;
+  let continuationCompleted = false;
   const dispatched = [];
   const environment = await startEnvironment({
     id: "environment-start",
@@ -620,17 +629,38 @@ test("starts a turn through acknowledged dispatch and observes running and compl
       },
     ],
     orchestration: {
-      thread: () =>
-        threadSnapshot({
+      thread: () => {
+        const running = continuationStarted ? !continuationCompleted : !completed;
+        return threadSnapshot({
           id: startedThreadId,
           projectId: "project-start",
-          latestState: completed ? "completed" : "running",
-          sessionStatus: completed ? "ready" : "running",
-        }),
+          latestState: running ? "running" : "completed",
+          sessionStatus: running ? "running" : "ready",
+          messages: continuationStarted
+            ? [
+                message("user-1", "user", "Inspect the project and report the result.", "turn-1"),
+                message("assistant-1", "assistant", "initial result", "turn-1"),
+                message("user-2", "user", "Check the same thread.", "turn-2"),
+                message(
+                  "assistant-2",
+                  "assistant",
+                  continuationCompleted ? "continued result" : "continued work",
+                  "turn-2",
+                ),
+              ]
+            : undefined,
+        });
+      },
     },
     dispatch: (command) => {
       dispatched.push(command);
       if (command.type === "thread.create") startedThreadId = command.threadId;
+      if (
+        command.type === "thread.turn.start" &&
+        dispatched.filter((entry) => entry.type === "thread.turn.start").length === 2
+      ) {
+        continuationStarted = true;
+      }
       return { sequence: dispatched.length };
     },
   });
@@ -675,6 +705,293 @@ test("starts a turn through acknowledged dispatch and observes running and compl
       arguments: { environmentId: "environment-start", threadId: startedThreadId },
     });
     assert.equal(content(finished).thread.status, "completed");
+
+    const continued = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-start",
+        threadId: startedThreadId,
+        prompt: "Check the same thread.",
+      },
+    });
+    const continuation = content(continued).continuation;
+    assert.equal(continuation.outcome, "acknowledged");
+    assert.equal(continuation.environmentId, "environment-start");
+    assert.equal(continuation.threadId, startedThreadId);
+    assert.ok(continuation.turnCommandId);
+    assert.ok(continuation.messageId);
+    assert.equal(continuation.turnSequence, 3);
+    assert.deepEqual(
+      dispatched.map((command) => command.type),
+      ["thread.create", "thread.turn.start", "thread.turn.start"],
+    );
+    assert.equal(dispatched[2].threadId, startedThreadId);
+    assert.equal(dispatched[2].message.text, "Check the same thread.");
+    assert.equal(dispatched[2].message.role, "user");
+    assert.deepEqual(dispatched[2].message.attachments, []);
+
+    const continuedRunning = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-start", threadId: startedThreadId },
+    });
+    assert.equal(content(continuedRunning).thread.status, "running");
+
+    continuationCompleted = true;
+    const continuedFinished = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-start", threadId: startedThreadId },
+    });
+    const continuedThread = content(continuedFinished).thread;
+    assert.equal(continuedThread.status, "completed");
+    assert.deepEqual(
+      continuedThread.messages.map((entry) => [entry.role, entry.text, entry.turnId]),
+      [
+        ["user", "Inspect the project and report the result.", "turn-1"],
+        ["assistant", "initial result", "turn-1"],
+        ["user", "Check the same thread.", "turn-2"],
+        ["assistant", "continued result", "turn-2"],
+      ],
+    );
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("reports active and approval-blocked continuation threads without dispatching", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-continue-conflicts-"));
+  let dispatchCount = 0;
+  const environment = await startEnvironment({
+    id: "environment-continue-conflicts",
+    label: "Continue conflicts",
+    grants: new Map([["grant-continue-conflicts", "token-continue-conflicts"]]),
+    orchestration: {
+      threads: new Map([
+        [
+          "active-thread",
+          threadSnapshot({ id: "active-thread", latestState: "running", sessionStatus: "running" }),
+        ],
+        [
+          "approval-thread",
+          threadSnapshot({
+            id: "approval-thread",
+            latestState: "running",
+            sessionStatus: "running",
+            activities: [activity("approval.requested", { requestId: "approval-1" })],
+          }),
+        ],
+      ]),
+    },
+    dispatch: () => {
+      dispatchCount += 1;
+      return { sequence: dispatchCount };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-continue-conflicts" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    for (const arguments_ of [
+      { environmentId: "", threadId: "active-thread", prompt: "do work" },
+      { environmentId: "environment-continue-conflicts", threadId: "", prompt: "do work" },
+      { environmentId: "environment-continue-conflicts", threadId: "active-thread", prompt: " " },
+    ]) {
+      const invalid = await client.callTool({ name: "continue_turn", arguments: arguments_ });
+      assert.equal(invalid.isError, true);
+    }
+
+    const active = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-continue-conflicts",
+        threadId: "active-thread",
+        prompt: "do not queue this",
+      },
+    });
+    assert.equal(content(active).error.code, "thread_busy");
+
+    const approval = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-continue-conflicts",
+        threadId: "approval-thread",
+        prompt: "do not bypass approval",
+      },
+    });
+    assert.equal(content(approval).error.code, "approval_required");
+    assert.equal(dispatchCount, 0);
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("uses the upstream dispatch result when a thread changes after observation", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-continue-race-"));
+  let observed = false;
+  let dispatchCount = 0;
+  const environment = await startEnvironment({
+    id: "environment-continue-race",
+    label: "Continue race",
+    grants: new Map([["grant-continue-race", "token-continue-race"]]),
+    orchestration: {
+      thread: () =>
+        threadSnapshot({
+          id: "race-thread",
+          latestState: observed ? "running" : "completed",
+          sessionStatus: observed ? "running" : "ready",
+        }),
+    },
+    dispatch: () => {
+      dispatchCount += 1;
+      observed = true;
+      return { status: 409, body: { code: "conflict", detail: "private conflict detail" } };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-continue-race" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    const result = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-continue-race",
+        threadId: "race-thread",
+        prompt: "dispatch must recheck the state",
+      },
+    });
+    assert.equal(result.isError, true);
+    assert.equal(content(result).error.code, "dispatch_conflict");
+    assert.equal(JSON.stringify(result).includes("private conflict detail"), false);
+    assert.equal(dispatchCount, 1);
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("reports revoked authorization and missing continuation threads safely", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-continue-errors-"));
+  let revokedDispatchCount = 0;
+  let missingDispatchCount = 0;
+  const revoked = await startEnvironment({
+    id: "environment-revoked-continue",
+    label: "Revoked continuation",
+    grants: new Map([["grant-revoked-continue", "token-revoked-continue"]]),
+    orchestration: {
+      threads: new Map([["existing-thread", threadSnapshot({ id: "existing-thread" })]]),
+    },
+    dispatch: () => {
+      revokedDispatchCount += 1;
+      return { sequence: revokedDispatchCount };
+    },
+  });
+  const missing = await startEnvironment({
+    id: "environment-missing-continue",
+    label: "Missing continuation",
+    grants: new Map([["grant-missing-continue", "token-missing-continue"]]),
+    dispatch: () => {
+      missingDispatchCount += 1;
+      return { sequence: missingDispatchCount };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    for (const [server, grant] of [
+      [revoked, "grant-revoked-continue"],
+      [missing, "grant-missing-continue"],
+    ]) {
+      const paired = await client.callTool({
+        name: "add_environment",
+        arguments: { endpoint: server.baseUrl, grant },
+      });
+      assert.equal(paired.isError, undefined);
+    }
+
+    revoked.tokens.clear();
+    const unauthorized = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-revoked-continue",
+        threadId: "existing-thread",
+        prompt: "the session is revoked",
+      },
+    });
+    assert.equal(content(unauthorized).error.code, "session_expired");
+    assert.equal(JSON.stringify(unauthorized).includes("secret-session-token"), false);
+
+    const notFound = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-missing-continue",
+        threadId: "missing-thread",
+        prompt: "there is no such thread",
+      },
+    });
+    assert.equal(content(notFound).error.code, "thread_not_found");
+    assert.equal(missingDispatchCount, 0);
+    assert.equal(revokedDispatchCount, 0);
+  } finally {
+    await closeClient(client);
+    await revoked.close();
+    await missing.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("reports a dropped continuation acknowledgement as unknown without replaying it", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-continue-unknown-"));
+  let dispatchCount = 0;
+  const environment = await startEnvironment({
+    id: "environment-continue-unknown",
+    label: "Unknown continuation",
+    grants: new Map([["grant-continue-unknown", "token-continue-unknown"]]),
+    orchestration: {
+      threads: new Map([["known-thread", threadSnapshot({ id: "known-thread" })]]),
+    },
+    dispatch: () => {
+      dispatchCount += 1;
+      return { drop: true };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-continue-unknown" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    const result = await client.callTool({
+      name: "continue_turn",
+      arguments: {
+        environmentId: "environment-continue-unknown",
+        threadId: "known-thread",
+        prompt: "the acknowledgement may be lost",
+      },
+    });
+    const continuation = content(result).continuation;
+    assert.equal(continuation.outcome, "unknown");
+    assert.equal(continuation.error.code, "unknown_outcome");
+    assert.equal(continuation.threadId, "known-thread");
+    assert.ok(continuation.turnCommandId);
+    assert.ok(continuation.messageId);
+    assert.equal(dispatchCount, 1);
   } finally {
     await closeClient(client);
     await environment.close();

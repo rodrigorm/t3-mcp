@@ -81,6 +81,21 @@ export interface PublicStartTurn {
   };
 }
 
+export type PublicContinueTurnOutcome = "acknowledged" | "unknown";
+
+export interface PublicContinueTurn {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly outcome: PublicContinueTurnOutcome;
+  readonly turnCommandId: string;
+  readonly messageId: string;
+  readonly turnSequence?: number;
+  readonly error?: {
+    readonly code: string;
+    readonly message: string;
+  };
+}
+
 export type PublicThreadStatus =
   | "idle"
   | "starting"

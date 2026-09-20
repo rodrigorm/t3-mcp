@@ -38,6 +38,13 @@ Issue #4 adds first-turn submission:
   thread reference. It does not claim completion or invent a turn identifier; use `get_thread` to
   observe execution.
 
+Issue #5 adds continuation:
+
+- `continue_turn`: requires `environmentId`, `threadId`, and a nonempty `prompt`. It rejects
+  observed active, approval-blocked, and input-blocked threads, then submits one new turn to the
+  selected thread. A continuation acknowledgement returns its command and message identifiers;
+  use `get_thread` to observe the new turn.
+
 Pairing URL fragments use the upstream form `#token=...`. The response never includes the
 grant, access token, authenticated URL, or raw upstream error body.
 

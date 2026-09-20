@@ -18,6 +18,7 @@ import {
   type ModelSelection,
   type PairedEnvironment,
   type PublicEnvironment,
+  type PublicContinueTurn,
   type PublicProject,
   type PublicStartTurn,
   type PublicThread,
@@ -43,6 +44,12 @@ export interface StartTurnInput {
   readonly projectId: string;
   readonly prompt: string;
   readonly modelSelection?: ModelSelection;
+}
+
+export interface ContinueTurnInput {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly prompt: string;
 }
 
 function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
@@ -298,6 +305,84 @@ export class EnvironmentConnector {
       turnCommandId,
       turnSequence,
     };
+  }
+
+  async continueTurn(input: ContinueTurnInput): Promise<PublicContinueTurn> {
+    const environmentId = typeof input?.environmentId === "string" ? input.environmentId.trim() : "";
+    const threadId = typeof input?.threadId === "string" ? input.threadId.trim() : "";
+    const prompt = typeof input?.prompt === "string" ? input.prompt.trim() : "";
+    if (!environmentId) throw new ConnectorError("invalid_input", "environmentId is required.");
+    if (!threadId) throw new ConnectorError("invalid_input", "threadId is required.");
+    if (!prompt) throw new ConnectorError("invalid_input", "prompt is required.");
+    if (prompt.length > MAX_START_TURN_PROMPT_LENGTH) {
+      throw new ConnectorError(
+        "invalid_input",
+        `prompt must be ${MAX_START_TURN_PROMPT_LENGTH} characters or fewer.`,
+      );
+    }
+
+    const environment = await this.selectEnvironment(environmentId);
+    const thread = await getUpstreamThread(environment, threadId);
+    if (thread.status === "starting" || thread.status === "running") {
+      throw new ConnectorError(
+        "thread_busy",
+        "The selected thread has an active turn; wait for it to finish before continuing.",
+      );
+    }
+    if (thread.status === "approval_required") {
+      throw new ConnectorError(
+        "approval_required",
+        "The selected thread is waiting for approval; resolve it in T3 Code before continuing.",
+      );
+    }
+    if (thread.status === "input_required") {
+      throw new ConnectorError(
+        "input_required",
+        "The selected thread is waiting for input; resolve it in T3 Code before continuing.",
+      );
+    }
+    if (thread.status === "unknown") {
+      throw new ConnectorError(
+        "upstream_incompatible",
+        "The selected thread has an unsupported state; inspect it in T3 Code before continuing.",
+      );
+    }
+
+    const turnCommandId = randomUUID();
+    const messageId = randomUUID();
+    const continuation = {
+      environmentId: environment.environmentId,
+      threadId,
+      turnCommandId,
+      messageId,
+    };
+    try {
+      const { sequence: turnSequence } = await dispatchCommand(environment, {
+        type: "thread.turn.start",
+        commandId: turnCommandId,
+        threadId,
+        message: {
+          messageId,
+          role: "user",
+          text: prompt,
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: new Date().toISOString(),
+      });
+      return { ...continuation, outcome: "acknowledged", turnSequence };
+    } catch (error) {
+      const failure = safeError(error);
+      if (failure.code === "unknown_outcome") {
+        return {
+          ...continuation,
+          outcome: "unknown",
+          error: { code: failure.code, message: failure.message },
+        };
+      }
+      throw failure;
+    }
   }
 
   async getThread(input: GetThreadInput): Promise<PublicThread> {

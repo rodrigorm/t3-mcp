@@ -54,12 +54,28 @@ The MCP result reports acknowledgement separately from completion and never fabr
 If the first turn dispatch fails after creation, the result retains the thread id. Transport or invalid
 acknowledgement failures are `unknown`; the connector never automatically replays either mutation.
 
+## Continuation Dispatch Contract
+
+`continue_turn` reads the selected thread to reject an already observed active, approval-blocked, or
+input-blocked state. This read is advisory only: the connector still sends one authenticated
+`thread.turn.start` command with the caller's thread id, a new command id, a new user message id,
+the prompt, empty attachments, `runtimeMode=full-access`, `interactionMode=default`, and an ISO
+creation time. It does not create a thread, fork the request, or submit an approval response.
+
+The upstream dispatch result remains authoritative if the thread changes after observation. Known
+busy, approval, authorization, missing-thread, and conflict responses become sanitized structured
+errors. A lost or invalid acknowledgement is `unknown` with the thread, command, and message
+identifiers; the connector never replays the command. The upstream command contract has no client
+precondition for an expected snapshot sequence, so an acknowledgement means acceptance only and
+does not promise exactly-once execution or completion.
+
 ## Verification
 
 The automated tests run an actual MCP client against the stdio connector and controlled HTTP
 servers implementing this contract. They cover descriptor and token exchange, invalid grants,
 restart persistence, failed replacement, two-environment registration isolation, project discovery,
-thread status mapping, bounded pagination, first-turn acknowledgement and failure handling, malformed
+thread status mapping, bounded pagination, first-turn and continuation acknowledgement/failure handling,
+same-thread retrieval, malformed
 and insecure URLs, redaction, owner-only storage, and redirect rejection.
 
 A live direct-pairing smoke check against a real T3 environment without Connect is not recorded

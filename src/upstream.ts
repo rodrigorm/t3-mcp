@@ -28,6 +28,70 @@ function requiredString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function dispatchErrorHint(value: unknown): string {
+  if (!isRecord(value)) return "";
+  return [value.code, value.reason, value.detail]
+    .filter((part): part is string => typeof part === "string")
+    .join(" ")
+    .toLowerCase();
+}
+
+async function dispatchFailure(response: Response): Promise<never> {
+  if (response.status === 401) {
+    throw new ConnectorError(
+      "session_expired",
+      "The saved environment session expired or was revoked; pair the environment again.",
+    );
+  }
+  if (response.status === 403) {
+    throw new ConnectorError("permission_denied", "The environment denied this operation.");
+  }
+
+  let hint = "";
+  try {
+    hint = dispatchErrorHint(await response.json());
+  } catch {
+    // The status is enough for the generic dispatch failure below.
+  }
+
+  if (
+    hint.includes("thread_not_found") ||
+    (hint.includes("thread") && (hint.includes("not found") || hint.includes("does not exist")))
+  ) {
+    throw new ConnectorError("thread_not_found", "The requested thread was not found.");
+  }
+  if (hint.includes("approval")) {
+    throw new ConnectorError(
+      "approval_required",
+      "The selected thread is waiting for approval; resolve it in T3 Code before continuing.",
+    );
+  }
+  if (
+    response.status === 423 ||
+    hint.includes("busy") ||
+    hint.includes("active_turn") ||
+    hint.includes("active turn") ||
+    hint.includes("already running") ||
+    hint.includes("in_progress") ||
+    hint.includes("in progress")
+  ) {
+    throw new ConnectorError(
+      "thread_busy",
+      "The selected thread has an active turn; wait for it to finish before continuing.",
+    );
+  }
+  if (response.status === 404) {
+    throw new ConnectorError("thread_not_found", "The requested thread was not found.");
+  }
+  if (response.status === 409) {
+    throw new ConnectorError(
+      "dispatch_conflict",
+      "The selected thread changed before the continuation was accepted; inspect it before retrying.",
+    );
+  }
+  throw new ConnectorError("dispatch_failed", "The environment rejected the command.");
+}
+
 function parseDescriptor(value: unknown): EnvironmentDescriptor {
   if (!isRecord(value)) {
     throw new ConnectorError("upstream_incompatible", "The environment descriptor is invalid.");
@@ -94,8 +158,11 @@ async function request(
     if (errorCode === "pairing" && (response.status === 401 || response.status === 400)) {
       throw new ConnectorError("pairing_rejected", "The environment rejected the pairing grant.");
     }
+    if (errorCode === "dispatch") {
+      throw await dispatchFailure(response);
+    }
     if (
-      (errorCode === "projects" || errorCode === "thread" || errorCode === "dispatch") &&
+      (errorCode === "projects" || errorCode === "thread") &&
       response.status === 401
     ) {
       throw new ConnectorError(
@@ -108,9 +175,6 @@ async function request(
     }
     if (errorCode === "thread" && response.status === 404) {
       throw new ConnectorError("thread_not_found", "The requested thread was not found.");
-    }
-    if (errorCode === "dispatch") {
-      throw new ConnectorError("dispatch_failed", "The environment rejected the command.");
     }
     throw new ConnectorError(
       errorCode === "descriptor" || errorCode === "projects" || errorCode === "thread"

@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   EnvironmentConnector,
   type AddEnvironmentInput,
+  type ContinueTurnInput as ConnectorContinueTurnInput,
   type StartTurnInput as ConnectorStartTurnInput,
 } from "./connector.js";
 import { ConnectorError } from "./errors.js";
@@ -99,6 +100,19 @@ const startTurnResultSchema = z.object({
   start: startTurnSchema.optional(),
   error: errorSchema.optional(),
 });
+const continueTurnSchema = z.object({
+  environmentId: z.string(),
+  threadId: z.string(),
+  outcome: z.enum(["acknowledged", "unknown"]),
+  turnCommandId: z.string(),
+  messageId: z.string(),
+  turnSequence: z.number().int().optional(),
+  error: errorSchema.optional(),
+});
+const continueTurnResultSchema = z.object({
+  continuation: continueTurnSchema.optional(),
+  error: errorSchema.optional(),
+});
 
 const addInputSchema = z.object({
   pairingUrl: z.string().trim().min(1).max(8192).optional(),
@@ -134,10 +148,15 @@ const startTurnInputSchema = environmentIdInputSchema.extend({
   prompt: z.string().trim().min(1).max(MAX_START_TURN_PROMPT_LENGTH),
   modelSelection: modelSelectionSchema.optional(),
 });
+const continueTurnInputSchema = environmentIdInputSchema.extend({
+  threadId: z.string().trim().min(1).max(512),
+  prompt: z.string().trim().min(1).max(MAX_START_TURN_PROMPT_LENGTH),
+});
 
 type EnvironmentIdInput = z.infer<typeof environmentIdInputSchema>;
 type GetThreadInput = z.infer<typeof getThreadInputSchema>;
 type StartTurnToolInput = z.infer<typeof startTurnInputSchema>;
+type ContinueTurnToolInput = z.infer<typeof continueTurnInputSchema>;
 
 function textResult(structuredContent: Record<string, unknown>, isError = false) {
   return {
@@ -218,6 +237,20 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       run(
         () => connector.startTurn(input satisfies ConnectorStartTurnInput),
         (start) => ({ start }),
+      ),
+  );
+  server.registerTool(
+    "continue_turn",
+    {
+      description: "Submit a new turn to an explicitly selected existing thread.",
+      inputSchema: continueTurnInputSchema,
+      outputSchema: continueTurnResultSchema,
+      annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
+    },
+    async (input: ContinueTurnToolInput) =>
+      run(
+        () => connector.continueTurn(input satisfies ConnectorContinueTurnInput),
+        (continuation) => ({ continuation }),
       ),
   );
   server.registerTool(
