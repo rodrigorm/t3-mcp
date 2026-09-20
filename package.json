@@ -9,6 +9,8 @@
   },
   "files": [
     "dist",
+    "skills",
+    "docs/compatibility.md",
     "README.md",
     "LICENSE"
   ],

@@ -69,6 +69,15 @@ identifiers; the connector never replays the command. The upstream command contr
 precondition for an expected snapshot sequence, so an acknowledgement means acceptance only and
 does not promise exactly-once execution or completion.
 
+## Support statement
+
+The supported upstream contract is T3 Code's direct environment and orchestration protocol version
+`1`, evidenced by upstream commit `7445aa733ada33e45289e5aa5055f79142556513`. The automated fixture
+advertises server version `0.0.42` and implements that contract; the public MCP tests exercise
+pairing, discovery, dispatch, observation, pagination, authorization failures, and ambiguous
+mutation outcomes against it. This is tested protocol compatibility, not a claim that the fixture's
+server version is a currently deployed T3 release.
+
 ## Verification
 
 The automated tests run an actual MCP client against the stdio connector and controlled HTTP
@@ -78,5 +87,6 @@ thread status mapping, bounded pagination, first-turn and continuation acknowled
 same-thread retrieval, malformed
 and insecure URLs, redaction, owner-only storage, and redirect rejection.
 
-A live direct-pairing smoke check against a real T3 environment without Connect is not recorded
-in this repository: this workspace has no operator-provided environment endpoint and grant.
+A live direct-pairing smoke check against a real T3 environment without Connect was not run for this
+release because this workspace has no operator-provided environment endpoint and grant. No live
+pair, list, start, retrieve, continue, retrieve result is claimed.
