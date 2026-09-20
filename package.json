@@ -1,0 +1,35 @@
+{
+  "name": "t3-mcp",
+  "version": "0.1.0",
+  "description": "Host-independent MCP connector for T3 Code environments",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "t3-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "docs/compatibility.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test",
+    "check": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2"
+  }
+}
