@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import { ConnectorError } from "./errors.js";
-import { EnvironmentStore } from "./storage.js";
+import { ConnectManager, type ConnectEnvironment, type PublicConnectAuth } from "./connect.js";
+import { ConnectStore, EnvironmentStore } from "./storage.js";
 import {
   dispatchCommand,
   getProjectForStart,
@@ -16,12 +17,14 @@ import {
   MAX_START_TURN_PROMPT_LENGTH,
   MAX_THREAD_HISTORY_TURN_LIMIT,
   type ModelSelection,
+  type EnvironmentAccess,
   type PairedEnvironment,
   type PublicEnvironment,
   type PublicContinueTurn,
   type PublicProject,
   type PublicStartTurn,
   type PublicThread,
+  type PairingResult,
 } from "./types.js";
 
 export interface AddEnvironmentInput {
@@ -52,6 +55,21 @@ export interface ContinueTurnInput {
   readonly prompt: string;
 }
 
+export interface ConnectAuthInput {
+  readonly action?: "start" | "status" | "cancel";
+}
+
+export interface RegisterConnectEnvironmentInput {
+  readonly environmentId: string;
+  readonly label?: string;
+}
+
+export interface AttachConnectEnvironmentInput {
+  readonly environmentId: string;
+  readonly targetEnvironmentId: string;
+  readonly label?: string;
+}
+
 function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
   return {
     id: environment.environmentId,
@@ -62,6 +80,29 @@ function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
     scopes: environment.scopes,
     sessionExpiresAt: environment.sessionExpiresAt,
     pairedAt: environment.pairedAt,
+    ...(environment.accessSource === "connect" ? { source: "connect" as const } : {}),
+    ...(environment.connectAccess ? { connectAttached: true } : {}),
+  };
+}
+
+function accessFromPairing(pair: {
+  readonly descriptor: PairingResult["descriptor"];
+  readonly accessToken: PairingResult["accessToken"];
+  readonly sessionExpiresAt: PairingResult["sessionExpiresAt"];
+  readonly scopes: PairingResult["scopes"];
+  readonly tokenType: PairingResult["tokenType"];
+  readonly dpopPrivateJwk?: PairingResult["dpopPrivateJwk"];
+}, endpoint: string): EnvironmentAccess {
+  return {
+    endpoint,
+    serverVersion: pair.descriptor.serverVersion,
+    orchestrationProtocolVersion: pair.descriptor.orchestrationProtocolVersion,
+    scopes: [...pair.scopes],
+    sessionExpiresAt: pair.sessionExpiresAt,
+    pairedAt: new Date().toISOString(),
+    accessToken: pair.accessToken,
+    tokenType: pair.tokenType,
+    ...(pair.dpopPrivateJwk ? { dpopPrivateJwk: pair.dpopPrivateJwk } : {}),
   };
 }
 
@@ -145,7 +186,14 @@ function safeError(error: unknown): ConnectorError {
 }
 
 export class EnvironmentConnector {
-  constructor(private readonly store: EnvironmentStore) {}
+  private readonly connect: ConnectManager;
+
+  constructor(
+    private readonly store: EnvironmentStore,
+    connectStore = new ConnectStore(store.directory),
+  ) {
+    this.connect = new ConnectManager(connectStore);
+  }
 
   private async selectEnvironment(environmentId: string): Promise<PairedEnvironment> {
     if (typeof environmentId !== "string" || !environmentId.trim()) {
@@ -156,14 +204,20 @@ export class EnvironmentConnector {
     if (!environment) {
       throw new ConnectorError("environment_not_found", "The selected environment is not saved.");
     }
-    const expiresAt = Date.parse(environment.sessionExpiresAt);
-    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
-      throw new ConnectorError(
-        "session_expired",
-        "The saved environment session expired or was revoked; pair the environment again.",
-      );
+    const candidates: PairedEnvironment[] = [environment];
+    if (environment.accessSource === "connect" && environment.directAccess) {
+      candidates.push({ ...environment, ...environment.directAccess, accessSource: "direct" });
+    } else if (environment.accessSource === "direct" && environment.connectAccess) {
+      candidates.push({ ...environment, ...environment.connectAccess, accessSource: "connect" });
     }
-    return environment;
+    for (const candidate of candidates) {
+      const expiresAt = Date.parse(candidate.sessionExpiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt > Date.now()) return candidate;
+    }
+    throw new ConnectorError(
+      "session_expired",
+      "The saved environment session expired or was revoked; pair the environment again.",
+    );
   }
 
   async addEnvironment(input: AddEnvironmentInput): Promise<PublicEnvironment> {
@@ -205,17 +259,19 @@ export class EnvironmentConnector {
       );
     }
 
+    const directAccess = accessFromPairing(paired, safeEndpoint);
     const registration: PairedEnvironment = {
       environmentId,
       label: cleanLabel(input.label, paired.descriptor.label, secrets),
-      endpoint: safeEndpoint,
-      serverVersion: paired.descriptor.serverVersion,
-      orchestrationProtocolVersion: paired.descriptor.orchestrationProtocolVersion,
-      scopes: [...paired.scopes],
-      sessionExpiresAt: paired.sessionExpiresAt,
-      pairedAt: new Date().toISOString(),
-      accessToken: paired.accessToken,
-      tokenType: paired.tokenType,
+      ...directAccess,
+      accessSource: "direct",
+      directAccess,
+      ...(environments.get(environmentId)?.connectAccess
+        ? { connectAccess: environments.get(environmentId)?.connectAccess }
+        : {}),
+      ...(environments.get(environmentId)?.connectAccountId
+        ? { connectAccountId: environments.get(environmentId)?.connectAccountId }
+        : {}),
     };
     environments.set(environmentId, registration);
     await this.store.replace(environments);
@@ -227,6 +283,105 @@ export class EnvironmentConnector {
     return [...environments.values()]
       .sort((left, right) => left.label.localeCompare(right.label) || left.environmentId.localeCompare(right.environmentId))
       .map(publicEnvironment);
+  }
+
+  async connectAuth(input: ConnectAuthInput = {}): Promise<PublicConnectAuth> {
+    return this.connect.authenticate(input.action);
+  }
+
+  async listConnectEnvironments(): Promise<readonly ConnectEnvironment[]> {
+    return this.connect.listEnvironments();
+  }
+
+  async registerConnectEnvironment(
+    input: RegisterConnectEnvironmentInput,
+  ): Promise<PublicEnvironment> {
+    const environmentId = typeof input?.environmentId === "string" ? input.environmentId.trim() : "";
+    if (!environmentId) throw new ConnectorError("invalid_input", "environmentId is required.");
+    const environments = await this.store.read();
+    if (environments.has(environmentId)) {
+      throw new ConnectorError(
+        "environment_exists",
+        "An environment with this identifier is already saved; attach Connect access explicitly.",
+      );
+    }
+    const connected = await this.connect.connectEnvironment(environmentId);
+    const endpoint = connected.environment.endpoint;
+    const access = accessFromPairing(connected.pairing, endpoint);
+    const registration: PairedEnvironment = {
+      environmentId,
+      label: cleanLabel(input.label, connected.environment.label, [connected.credential, connected.pairing.accessToken]),
+      ...access,
+      accessSource: "connect",
+      connectAccess: access,
+      ...(connected.accountId ? { connectAccountId: connected.accountId } : {}),
+    };
+    environments.set(environmentId, registration);
+    await this.store.replace(environments);
+    return publicEnvironment(registration);
+  }
+
+  async attachConnectEnvironment(
+    input: AttachConnectEnvironmentInput,
+  ): Promise<PublicEnvironment> {
+    const environmentId = typeof input?.environmentId === "string" ? input.environmentId.trim() : "";
+    const targetEnvironmentId =
+      typeof input?.targetEnvironmentId === "string" ? input.targetEnvironmentId.trim() : "";
+    if (!environmentId || !targetEnvironmentId) {
+      throw new ConnectorError("invalid_input", "environmentId and targetEnvironmentId are required.");
+    }
+    if (environmentId !== targetEnvironmentId) {
+      throw new ConnectorError(
+        "connect_identity_mismatch",
+        "Connect access can only attach when the upstream environment identifier matches the saved registration.",
+      );
+    }
+    const environments = await this.store.read();
+    const existing = environments.get(targetEnvironmentId);
+    if (!existing) throw new ConnectorError("environment_not_found", "The selected environment is not saved.");
+    const connected = await this.connect.connectEnvironment(environmentId);
+    if (connected.pairing.descriptor.environmentId !== targetEnvironmentId) {
+      throw new ConnectorError("connect_identity_mismatch", "Connect returned a different environment identity.");
+    }
+    const endpoint = connected.environment.endpoint;
+    const connectAccess = accessFromPairing(connected.pairing, endpoint);
+    const directAccess = existing.directAccess ??
+      (existing.accessSource === "direct" ? {
+        endpoint: existing.endpoint,
+        serverVersion: existing.serverVersion,
+        orchestrationProtocolVersion: existing.orchestrationProtocolVersion,
+        scopes: existing.scopes,
+        sessionExpiresAt: existing.sessionExpiresAt,
+        pairedAt: existing.pairedAt,
+        accessToken: existing.accessToken,
+        tokenType: existing.tokenType,
+        ...(existing.dpopPrivateJwk ? { dpopPrivateJwk: existing.dpopPrivateJwk } : {}),
+      } satisfies EnvironmentAccess : undefined);
+    const registration: PairedEnvironment = {
+      ...existing,
+      label: cleanLabel(input.label, existing.label, [connected.credential, connected.pairing.accessToken]),
+      ...connectAccess,
+      accessSource: "connect",
+      ...(directAccess ? { directAccess } : {}),
+      connectAccess,
+      ...(connected.accountId ? { connectAccountId: connected.accountId } : {}),
+    };
+    environments.set(targetEnvironmentId, registration);
+    await this.store.replace(environments);
+    return publicEnvironment(registration);
+  }
+
+  async signOutConnect(): Promise<{ readonly signedOut: boolean }> {
+    return this.connect.signOut();
+  }
+
+  async unregisterEnvironment(environmentId: string): Promise<{ readonly environmentId: string; readonly unregistered: true }> {
+    if (typeof environmentId !== "string" || !environmentId.trim()) {
+      throw new ConnectorError("invalid_input", "environmentId is required.");
+    }
+    const removed = await this.store.remove(environmentId.trim());
+    if (!removed) throw new ConnectorError("environment_not_found", "The selected environment is not saved.");
+    return { environmentId: environmentId.trim(), unregistered: true };
   }
 
   async listProjects(environmentId: string): Promise<readonly PublicProject[]> {
