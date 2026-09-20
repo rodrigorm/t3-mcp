@@ -4,9 +4,10 @@ import { z } from "zod";
 import {
   EnvironmentConnector,
   type AddEnvironmentInput,
+  type StartTurnInput as ConnectorStartTurnInput,
 } from "./connector.js";
 import { ConnectorError } from "./errors.js";
-import { MAX_THREAD_HISTORY_TURN_LIMIT } from "./types.js";
+import { MAX_START_TURN_PROMPT_LENGTH, MAX_THREAD_HISTORY_TURN_LIMIT } from "./types.js";
 
 const environmentSchema = z.object({
   id: z.string(),
@@ -83,6 +84,21 @@ const getThreadResultSchema = z.object({
   thread: threadSchema.optional(),
   error: errorSchema.optional(),
 });
+const startTurnSchema = z.object({
+  environmentId: z.string(),
+  projectId: z.string(),
+  threadId: z.string(),
+  outcome: z.enum(["acknowledged", "partial", "unknown"]),
+  createCommandId: z.string(),
+  turnCommandId: z.string().optional(),
+  createSequence: z.number().int().optional(),
+  turnSequence: z.number().int().optional(),
+  error: errorSchema.optional(),
+});
+const startTurnResultSchema = z.object({
+  start: startTurnSchema.optional(),
+  error: errorSchema.optional(),
+});
 
 const addInputSchema = z.object({
   pairingUrl: z.string().trim().min(1).max(8192).optional(),
@@ -101,9 +117,27 @@ const getThreadInputSchema = environmentIdInputSchema.extend({
   turnLimit: z.number().int().min(1).max(MAX_THREAD_HISTORY_TURN_LIMIT).optional(),
   beforeCursor: z.string().trim().min(1).max(4096).optional(),
 });
+const modelSelectionSchema = z.object({
+  instanceId: z.string().trim().min(1).max(512),
+  model: z.string().trim().min(1).max(512),
+  options: z
+    .array(
+      z.object({
+        id: z.string().trim().min(1).max(512),
+        value: z.union([z.string().trim().min(1).max(4096), z.boolean()]),
+      }),
+    )
+    .optional(),
+});
+const startTurnInputSchema = environmentIdInputSchema.extend({
+  projectId: z.string().trim().min(1).max(512),
+  prompt: z.string().trim().min(1).max(MAX_START_TURN_PROMPT_LENGTH),
+  modelSelection: modelSelectionSchema.optional(),
+});
 
 type EnvironmentIdInput = z.infer<typeof environmentIdInputSchema>;
 type GetThreadInput = z.infer<typeof getThreadInputSchema>;
+type StartTurnToolInput = z.infer<typeof startTurnInputSchema>;
 
 function textResult(structuredContent: Record<string, unknown>, isError = false) {
   return {
@@ -169,6 +203,21 @@ export function createServer(connector: EnvironmentConnector): McpServer {
       run(
         () => connector.listProjects(input.environmentId),
         (projects) => ({ environmentId: input.environmentId, projects }),
+      ),
+  );
+  server.registerTool(
+    "start_turn",
+    {
+      description:
+        "Create a thread and submit its first turn in an explicitly selected environment and project.",
+      inputSchema: startTurnInputSchema,
+      outputSchema: startTurnResultSchema,
+      annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },
+    },
+    async (input: StartTurnToolInput) =>
+      run(
+        () => connector.startTurn(input satisfies ConnectorStartTurnInput),
+        (start) => ({ start }),
       ),
   );
   server.registerTool(

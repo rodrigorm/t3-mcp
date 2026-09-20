@@ -30,8 +30,19 @@ Issue #3 adds the read slice:
   activities, and bounded history. Pass `turnLimit` and the returned `nextCursor` as `beforeCursor`
   to page older turns. Approval or input requests are reported for handling in T3 Code.
 
+Issue #4 adds first-turn submission:
+
+- `start_turn`: requires `environmentId`, `projectId`, and a nonempty `prompt`. It uses the selected
+  project's upstream `defaultModelSelection`; pass `modelSelection` explicitly when that project has
+  no default. The result reports `acknowledged`, `partial`, or `unknown` dispatch outcome and a
+  thread reference. It does not claim completion or invent a turn identifier; use `get_thread` to
+  observe execution.
+
 Pairing URL fragments use the upstream form `#token=...`. The response never includes the
 grant, access token, authenticated URL, or raw upstream error body.
+
+Mutation acknowledgements are not replayed. A partial result keeps the created thread reference,
+and an ambiguous transport result is `unknown` so the caller can inspect the thread before retrying.
 
 ## Security
 

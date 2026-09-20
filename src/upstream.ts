@@ -12,6 +12,7 @@ import {
   type PublicThreadActivity,
   type PublicThreadMessage,
   type PublicThreadStatus,
+  type ModelSelection,
 } from "./types.js";
 
 const TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -65,7 +66,7 @@ function parseDescriptor(value: unknown): EnvironmentDescriptor {
 async function request(
   url: URL,
   init: RequestInit,
-  errorCode: "descriptor" | "pairing" | "session" | "projects" | "thread",
+  errorCode: "descriptor" | "pairing" | "session" | "projects" | "thread" | "dispatch",
 ): Promise<Response> {
   let response: Response;
   try {
@@ -75,6 +76,12 @@ async function request(
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch {
+    if (errorCode === "dispatch") {
+      throw new ConnectorError(
+        "unknown_outcome",
+        "The command acknowledgement was lost; inspect the thread before retrying.",
+      );
+    }
     throw new ConnectorError(
       "transport_error",
       errorCode === "pairing"
@@ -87,7 +94,10 @@ async function request(
     if (errorCode === "pairing" && (response.status === 401 || response.status === 400)) {
       throw new ConnectorError("pairing_rejected", "The environment rejected the pairing grant.");
     }
-    if ((errorCode === "projects" || errorCode === "thread") && response.status === 401) {
+    if (
+      (errorCode === "projects" || errorCode === "thread" || errorCode === "dispatch") &&
+      response.status === 401
+    ) {
       throw new ConnectorError(
         "session_expired",
         "The saved environment session expired or was revoked; pair the environment again.",
@@ -98,6 +108,9 @@ async function request(
     }
     if (errorCode === "thread" && response.status === 404) {
       throw new ConnectorError("thread_not_found", "The requested thread was not found.");
+    }
+    if (errorCode === "dispatch") {
+      throw new ConnectorError("dispatch_failed", "The environment rejected the command.");
     }
     throw new ConnectorError(
       errorCode === "descriptor" || errorCode === "projects" || errorCode === "thread"
@@ -226,7 +239,53 @@ function nullableString(value: unknown): value is string | null {
   return value === null || requiredString(value);
 }
 
-function parseProjects(value: unknown): readonly PublicProject[] {
+function parseModelSelection(value: unknown): ModelSelection | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const instanceId =
+    isRecord(value) && requiredString(value.instanceId)
+      ? value.instanceId
+      : isRecord(value) && requiredString(value.provider)
+        ? value.provider
+        : undefined;
+  if (!isRecord(value) || !requiredString(instanceId) || !requiredString(value.model)) {
+    return invalidOrchestration("The environment returned an invalid project model selection.");
+  }
+
+  let options: ModelSelection["options"];
+  if (value.options !== undefined) {
+    if (!Array.isArray(value.options)) {
+      return invalidOrchestration("The environment returned an invalid project model selection.");
+    }
+    options = value.options.map((option) => {
+      if (!isRecord(option) || !requiredString(option.id)) {
+        return invalidOrchestration("The environment returned an invalid project model selection.");
+      }
+      const optionValue =
+        typeof option.value === "boolean"
+          ? option.value
+          : requiredString(option.value)
+            ? option.value.trim()
+            : undefined;
+      if (optionValue === undefined) {
+        return invalidOrchestration("The environment returned an invalid project model selection.");
+      }
+      return { id: option.id.trim(), value: optionValue };
+    });
+  }
+
+  return {
+    instanceId: instanceId.trim(),
+    model: value.model.trim(),
+    ...(options === undefined ? {} : { options }),
+  };
+}
+
+interface ParsedProject extends PublicProject {
+  readonly defaultModelSelection?: unknown;
+}
+
+function parseProjects(value: unknown): readonly ParsedProject[] {
   if (!isRecord(value) || !Array.isArray(value.projects)) {
     return invalidOrchestration("The environment returned an invalid project snapshot.");
   }
@@ -244,7 +303,13 @@ function parseProjects(value: unknown): readonly PublicProject[] {
       return invalidOrchestration("The environment returned an invalid project snapshot.");
     }
     if (project.deletedAt !== undefined && project.deletedAt !== null) continue;
-    projects.push({ id: project.id.trim(), name: project.title.trim() });
+    projects.push({
+      id: project.id.trim(),
+      name: project.title.trim(),
+      ...(project.defaultModelSelection === undefined
+        ? {}
+        : { defaultModelSelection: project.defaultModelSelection }),
+    });
   }
   return projects;
 }
@@ -466,13 +531,31 @@ function parseThread(
   };
 }
 
-export async function listProjects(environment: PairedEnvironment): Promise<readonly PublicProject[]> {
+async function readProjectSnapshot(environment: PairedEnvironment): Promise<readonly ParsedProject[]> {
   const response = await request(
     endpointPath(new URL(environment.endpoint), "/api/orchestration/snapshot"),
     { method: "GET", headers: { authorization: `${environment.tokenType} ${environment.accessToken}` } },
     "projects",
   );
   return parseProjects(await json(response, "upstream_incompatible"));
+}
+
+export async function listProjects(environment: PairedEnvironment): Promise<readonly PublicProject[]> {
+  return (await readProjectSnapshot(environment)).map(({ id, name }) => ({ id, name }));
+}
+
+export async function getProjectForStart(
+  environment: PairedEnvironment,
+  projectId: string,
+): Promise<{ readonly id: string; readonly defaultModelSelection?: ModelSelection | null }> {
+  const project = (await readProjectSnapshot(environment)).find(({ id }) => id === projectId);
+  if (!project) {
+    throw new ConnectorError("project_not_found", "The selected project is not available in this environment.");
+  }
+  return {
+    id: project.id,
+    defaultModelSelection: parseModelSelection(project.defaultModelSelection),
+  };
 }
 
 export async function getThread(
@@ -493,6 +576,45 @@ export async function getThread(
     "thread",
   );
   return parseThread(await json(response, "upstream_incompatible"), environment.environmentId, threadId, turnLimit);
+}
+
+export interface DispatchAcknowledgement {
+  readonly sequence: number;
+}
+
+export async function dispatchCommand(
+  environment: PairedEnvironment,
+  command: Record<string, unknown>,
+): Promise<DispatchAcknowledgement> {
+  const response = await request(
+    endpointPath(new URL(environment.endpoint), "/api/orchestration/dispatch"),
+    {
+      method: "POST",
+      headers: {
+        authorization: `${environment.tokenType} ${environment.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(command),
+    },
+    "dispatch",
+  );
+
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    throw new ConnectorError(
+      "unknown_outcome",
+      "The command acknowledgement was invalid; inspect the thread before retrying.",
+    );
+  }
+  if (!isRecord(value) || !nonNegativeInteger(value.sequence)) {
+    throw new ConnectorError(
+      "unknown_outcome",
+      "The command acknowledgement was invalid; inspect the thread before retrying.",
+    );
+  }
+  return { sequence: value.sequence };
 }
 
 export { publicEndpoint };

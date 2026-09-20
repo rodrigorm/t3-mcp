@@ -1,6 +1,10 @@
+import { randomUUID } from "node:crypto";
+
 import { ConnectorError } from "./errors.js";
 import { EnvironmentStore } from "./storage.js";
 import {
+  dispatchCommand,
+  getProjectForStart,
   getThread as getUpstreamThread,
   listProjects as listUpstreamProjects,
   pairEnvironment,
@@ -9,10 +13,13 @@ import {
 import { parseEndpoint } from "./url.js";
 import {
   DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+  MAX_START_TURN_PROMPT_LENGTH,
   MAX_THREAD_HISTORY_TURN_LIMIT,
+  type ModelSelection,
   type PairedEnvironment,
   type PublicEnvironment,
   type PublicProject,
+  type PublicStartTurn,
   type PublicThread,
 } from "./types.js";
 
@@ -29,6 +36,13 @@ export interface GetThreadInput {
   readonly threadId: string;
   readonly turnLimit?: number;
   readonly beforeCursor?: string;
+}
+
+export interface StartTurnInput {
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly prompt: string;
+  readonly modelSelection?: ModelSelection;
 }
 
 function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
@@ -54,6 +68,51 @@ function cleanLabel(label: string | undefined, fallback: string, secrets: readon
     throw new ConnectorError("invalid_input", "Label must be a printable string of 200 characters or fewer.");
   }
   return value;
+}
+
+function cleanModelSelection(value: ModelSelection | undefined): ModelSelection | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !value ||
+    typeof value.instanceId !== "string" ||
+    !value.instanceId.trim() ||
+    typeof value.model !== "string" ||
+    !value.model.trim()
+  ) {
+    throw new ConnectorError("invalid_input", "modelSelection must include instanceId and model.");
+  }
+  if (
+    value.options !== undefined &&
+    (!Array.isArray(value.options) ||
+      value.options.some(
+        (option) =>
+          !option ||
+          typeof option.id !== "string" ||
+          !option.id.trim() ||
+          (typeof option.value !== "boolean" &&
+            (typeof option.value !== "string" || !option.value.trim())),
+      ))
+  ) {
+    throw new ConnectorError("invalid_input", "modelSelection options are invalid.");
+  }
+  return {
+    instanceId: value.instanceId.trim(),
+    model: value.model.trim(),
+    ...(value.options === undefined
+      ? {}
+      : {
+          options: value.options.map((option) => ({
+            id: option.id.trim(),
+            value: typeof option.value === "string" ? option.value.trim() : option.value,
+          })),
+        }),
+  };
+}
+
+function safeError(error: unknown): ConnectorError {
+  return error instanceof ConnectorError
+    ? error
+    : new ConnectorError("internal_error", "The connector could not complete the request.");
 }
 
 export class EnvironmentConnector {
@@ -143,6 +202,102 @@ export class EnvironmentConnector {
 
   async listProjects(environmentId: string): Promise<readonly PublicProject[]> {
     return listUpstreamProjects(await this.selectEnvironment(environmentId));
+  }
+
+  async startTurn(input: StartTurnInput): Promise<PublicStartTurn> {
+    const environmentId = typeof input?.environmentId === "string" ? input.environmentId.trim() : "";
+    const projectId = typeof input?.projectId === "string" ? input.projectId.trim() : "";
+    const prompt = typeof input?.prompt === "string" ? input.prompt.trim() : "";
+    if (!environmentId) throw new ConnectorError("invalid_input", "environmentId is required.");
+    if (!projectId) throw new ConnectorError("invalid_input", "projectId is required.");
+    if (!prompt) throw new ConnectorError("invalid_input", "prompt is required.");
+    if (prompt.length > MAX_START_TURN_PROMPT_LENGTH) {
+      throw new ConnectorError(
+        "invalid_input",
+        `prompt must be ${MAX_START_TURN_PROMPT_LENGTH} characters or fewer.`,
+      );
+    }
+    const explicitModelSelection = cleanModelSelection(input.modelSelection);
+    const environment = await this.selectEnvironment(environmentId);
+    const project = await getProjectForStart(environment, projectId);
+    const modelSelection = explicitModelSelection ?? project.defaultModelSelection;
+    if (!modelSelection) {
+      throw new ConnectorError(
+        "upstream_incompatible",
+        "The selected project does not provide a model default; supply modelSelection.",
+      );
+    }
+
+    const threadId = randomUUID();
+    const createCommandId = randomUUID();
+    const start = {
+      environmentId: environment.environmentId,
+      projectId,
+      threadId,
+      createCommandId,
+    };
+    let createSequence: number;
+    try {
+      ({ sequence: createSequence } = await dispatchCommand(environment, {
+        type: "thread.create",
+        commandId: createCommandId,
+        threadId,
+        projectId,
+        title: "New thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: new Date().toISOString(),
+      }));
+    } catch (error) {
+      const failure = safeError(error);
+      if (failure.code === "unknown_outcome") {
+        return {
+          ...start,
+          outcome: "unknown",
+          error: { code: failure.code, message: failure.message },
+        };
+      }
+      throw failure;
+    }
+
+    const turnCommandId = randomUUID();
+    let turnSequence: number;
+    try {
+      ({ sequence: turnSequence } = await dispatchCommand(environment, {
+        type: "thread.turn.start",
+        commandId: turnCommandId,
+        threadId,
+        message: {
+          messageId: randomUUID(),
+          role: "user",
+          text: prompt,
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: new Date().toISOString(),
+      }));
+    } catch (error) {
+      const failure = safeError(error);
+      return {
+        ...start,
+        outcome: failure.code === "unknown_outcome" ? "unknown" : "partial",
+        createSequence,
+        turnCommandId,
+        error: { code: failure.code, message: failure.message },
+      };
+    }
+
+    return {
+      ...start,
+      outcome: "acknowledged",
+      createSequence,
+      turnCommandId,
+      turnSequence,
+    };
   }
 
   async getThread(input: GetThreadInput): Promise<PublicThread> {

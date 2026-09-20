@@ -53,7 +53,15 @@ async function writeConfiguredResponse(response, value, url, fallbackStatus = 20
   return jsonResponse(response, fallbackStatus, resolved);
 }
 
-async function startEnvironment({ id, label, grants, redirectTo, projects = [], orchestration = {} } = {}) {
+async function startEnvironment({
+  id,
+  label,
+  grants,
+  redirectTo,
+  projects = [],
+  orchestration = {},
+  dispatch,
+} = {}) {
   const requests = [];
   const tokens = new Map();
   const server = await startHttpServer(async (request, response) => {
@@ -148,6 +156,31 @@ async function startEnvironment({ id, label, grants, redirectTo, projects = [], 
         }
         return writeConfiguredResponse(response, configuredThread, url);
       }
+    }
+
+    if (request.method === "POST" && request.url === "/api/orchestration/dispatch") {
+      const token = request.headers.authorization?.replace(/^Bearer /, "");
+      if (!token || !tokens.has(token)) {
+        return jsonResponse(response, 401, { code: "auth_invalid", token: "secret-session-token" });
+      }
+      if (orchestration.status) {
+        return jsonResponse(response, orchestration.status, { code: "denied", detail: "private detail" });
+      }
+      const command = JSON.parse(body);
+      const resolved = typeof dispatch === "function" ? await dispatch(command) : dispatch;
+      if (resolved?.drop) {
+        request.socket.destroy();
+        return;
+      }
+      if (
+        resolved &&
+        typeof resolved === "object" &&
+        "status" in resolved &&
+        "body" in resolved
+      ) {
+        return jsonResponse(response, resolved.status, resolved.body);
+      }
+      return jsonResponse(response, 200, resolved ?? { sequence: 1 });
     }
 
     response.writeHead(404);
@@ -286,7 +319,7 @@ test("pairs, persists, re-pairs safely, and lists through the public MCP seam", 
     const tools = await client.listTools();
     assert.deepEqual(
       tools.tools.map((tool) => tool.name).sort(),
-      ["add_environment", "get_thread", "list_environments", "list_projects"],
+      ["add_environment", "get_thread", "list_environments", "list_projects", "start_turn"],
     );
     assert.ok(tools.tools.find((tool) => tool.name === "add_environment").inputSchema.properties.pairingUrl);
 
@@ -565,6 +598,270 @@ test("discovers projects and retrieves environment-scoped thread states", async 
     await empty.close();
     await environmentA.close();
     await environmentB.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("starts a turn through acknowledged dispatch and observes running and completed results", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-start-"));
+  let startedThreadId;
+  let completed = false;
+  const dispatched = [];
+  const environment = await startEnvironment({
+    id: "environment-start",
+    label: "Start",
+    grants: new Map([["grant-start", "token-start"]]),
+    projects: [
+      {
+        id: "project-start",
+        title: "Start project",
+        deletedAt: null,
+        defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      },
+    ],
+    orchestration: {
+      thread: () =>
+        threadSnapshot({
+          id: startedThreadId,
+          projectId: "project-start",
+          latestState: completed ? "completed" : "running",
+          sessionStatus: completed ? "ready" : "running",
+        }),
+    },
+    dispatch: (command) => {
+      dispatched.push(command);
+      if (command.type === "thread.create") startedThreadId = command.threadId;
+      return { sequence: dispatched.length };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-start" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    const started = await client.callTool({
+      name: "start_turn",
+      arguments: {
+        environmentId: "environment-start",
+        projectId: "project-start",
+        prompt: "Inspect the project and report the result.",
+      },
+    });
+    const start = content(started).start;
+    assert.equal(start.outcome, "acknowledged");
+    assert.equal(start.environmentId, "environment-start");
+    assert.equal(start.projectId, "project-start");
+    assert.equal(start.threadId, startedThreadId);
+    assert.equal(start.createSequence, 1);
+    assert.equal(start.turnSequence, 2);
+    assert.equal("turnId" in start, false);
+    assert.deepEqual(dispatched.map((command) => command.type), ["thread.create", "thread.turn.start"]);
+    assert.equal(dispatched[0].modelSelection.instanceId, "codex");
+    assert.equal(dispatched[1].message.text, "Inspect the project and report the result.");
+
+    const running = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-start", threadId: startedThreadId },
+    });
+    assert.equal(content(running).thread.status, "running");
+
+    completed = true;
+    const finished = await client.callTool({
+      name: "get_thread",
+      arguments: { environmentId: "environment-start", threadId: startedThreadId },
+    });
+    assert.equal(content(finished).thread.status, "completed");
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("validates start inputs and project access before dispatching", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-start-validation-"));
+  const environment = await startEnvironment({
+    id: "environment-validation",
+    label: "Validation",
+    grants: new Map([["grant-validation", "token-validation"]]),
+    projects: [
+      {
+        id: "project-present",
+        title: "Present project",
+        deletedAt: null,
+        defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      },
+    ],
+  });
+  const denied = await startEnvironment({
+    id: "environment-denied-start",
+    label: "Denied start",
+    grants: new Map([["grant-denied-start", "token-denied-start"]]),
+    orchestration: { status: 403 },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    for (const [server, grant] of [
+      [environment, "grant-validation"],
+      [denied, "grant-denied-start"],
+    ]) {
+      const paired = await client.callTool({
+        name: "add_environment",
+        arguments: { endpoint: server.baseUrl, grant },
+      });
+      assert.equal(paired.isError, undefined);
+    }
+
+    for (const arguments_ of [
+      { environmentId: "environment-validation", projectId: "project-present", prompt: " " },
+      { environmentId: "environment-validation", projectId: "", prompt: "do work" },
+      { environmentId: "", projectId: "project-present", prompt: "do work" },
+    ]) {
+      const invalid = await client.callTool({ name: "start_turn", arguments: arguments_ });
+      assert.equal(invalid.isError, true);
+    }
+
+    const missing = await client.callTool({
+      name: "start_turn",
+      arguments: {
+        environmentId: "environment-validation",
+        projectId: "project-missing",
+        prompt: "do work",
+      },
+    });
+    assert.equal(content(missing).error.code, "project_not_found");
+
+    const deniedResult = await client.callTool({
+      name: "start_turn",
+      arguments: {
+        environmentId: "environment-denied-start",
+        projectId: "project-present",
+        prompt: "do work",
+      },
+    });
+    assert.equal(content(deniedResult).error.code, "permission_denied");
+    assert.equal(
+      environment.requests.some((request) => request.path === "/api/orchestration/dispatch"),
+      false,
+    );
+    assert.equal(
+      denied.requests.some((request) => request.path === "/api/orchestration/dispatch"),
+      false,
+    );
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await denied.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("returns the created thread when first-turn dispatch fails", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-start-partial-"));
+  const dispatched = [];
+  const environment = await startEnvironment({
+    id: "environment-partial",
+    label: "Partial",
+    grants: new Map([["grant-partial", "token-partial"]]),
+    projects: [
+      {
+        id: "project-partial",
+        title: "Partial project",
+        deletedAt: null,
+        defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      },
+    ],
+    dispatch: (command) => {
+      dispatched.push(command);
+      return command.type === "thread.create"
+        ? { sequence: 10 }
+        : { status: 500, body: { code: "private", detail: "do not expose" } };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-partial" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    const result = await client.callTool({
+      name: "start_turn",
+      arguments: {
+        environmentId: "environment-partial",
+        projectId: "project-partial",
+        prompt: "fail the first turn",
+      },
+    });
+    const start = content(result).start;
+    assert.equal(start.outcome, "partial");
+    assert.equal(start.threadId, dispatched[0].threadId);
+    assert.equal(start.createSequence, 10);
+    assert.ok(start.createCommandId);
+    assert.ok(start.turnCommandId);
+    assert.equal(start.error.code, "dispatch_failed");
+    assert.equal(JSON.stringify(result).includes("do not expose"), false);
+    assert.deepEqual(dispatched.map((command) => command.type), ["thread.create", "thread.turn.start"]);
+  } finally {
+    await closeClient(client);
+    await environment.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("reports a dropped create acknowledgement as unknown without replaying it", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-start-unknown-"));
+  let dispatchCount = 0;
+  const environment = await startEnvironment({
+    id: "environment-unknown",
+    label: "Unknown",
+    grants: new Map([["grant-unknown", "token-unknown"]]),
+    projects: [
+      {
+        id: "project-unknown",
+        title: "Unknown project",
+        deletedAt: null,
+        defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      },
+    ],
+    dispatch: () => {
+      dispatchCount += 1;
+      return { drop: true };
+    },
+  });
+  let client;
+  try {
+    client = await connectClient(stateDirectory);
+    const paired = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environment.baseUrl, grant: "grant-unknown" },
+    });
+    assert.equal(paired.isError, undefined);
+
+    const result = await client.callTool({
+      name: "start_turn",
+      arguments: {
+        environmentId: "environment-unknown",
+        projectId: "project-unknown",
+        prompt: "the acknowledgement may be lost",
+      },
+    });
+    const start = content(result).start;
+    assert.equal(start.outcome, "unknown");
+    assert.equal(start.error.code, "unknown_outcome");
+    assert.ok(start.threadId);
+    assert.equal(start.turnCommandId, undefined);
+    assert.equal(dispatchCount, 1);
+  } finally {
+    await closeClient(client);
+    await environment.close();
     await rm(stateDirectory, { recursive: true, force: true });
   }
 });

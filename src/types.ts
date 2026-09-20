@@ -2,6 +2,7 @@ export const SUPPORTED_ORCHESTRATION_PROTOCOL_VERSION = 1;
 export const REQUIRED_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
 export const DEFAULT_THREAD_HISTORY_TURN_LIMIT = 20;
 export const MAX_THREAD_HISTORY_TURN_LIMIT = 100;
+export const MAX_START_TURN_PROMPT_LENGTH = 120_000;
 
 export interface EnvironmentDescriptor {
   readonly environmentId: string;
@@ -50,6 +51,34 @@ export interface PairingResult {
 export interface PublicProject {
   readonly id: string;
   readonly name: string;
+}
+
+export interface ModelSelectionOption {
+  readonly id: string;
+  readonly value: string | boolean;
+}
+
+export interface ModelSelection {
+  readonly instanceId: string;
+  readonly model: string;
+  readonly options?: readonly ModelSelectionOption[];
+}
+
+export type PublicStartTurnOutcome = "acknowledged" | "partial" | "unknown";
+
+export interface PublicStartTurn {
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly outcome: PublicStartTurnOutcome;
+  readonly createCommandId: string;
+  readonly turnCommandId?: string;
+  readonly createSequence?: number;
+  readonly turnSequence?: number;
+  readonly error?: {
+    readonly code: string;
+    readonly message: string;
+  };
 }
 
 export type PublicThreadStatus =

@@ -35,13 +35,32 @@ DPoP is not requested because this connector does not implement DPoP proof keys.
 Thread reads default to 20 user-anchored turns and accept at most 100 per request. Each request is
 bounded by the connector's 10-second timeout and uses only the selected environment's session.
 
+## First-Turn Dispatch Contract
+
+`start_turn` first reads the selected environment's orchestration snapshot and requires the requested
+active project. The project `defaultModelSelection` supplies the upstream `ModelSelection`. If the
+project has no default, callers must provide the optional `modelSelection` input explicitly.
+
+The connector then sends two authenticated JSON requests to `POST /api/orchestration/dispatch`:
+
+1. `thread.create` with a connector-generated `threadId`, `commandId`, project id, `New thread` title,
+   the selected model, `runtimeMode=full-access`, `interactionMode=default`, null branch/worktree,
+   and an ISO creation time.
+2. `thread.turn.start` with the same thread id, a user message containing the prompt and no attachments,
+   `runtimeMode=full-access`, `interactionMode=default`, and an ISO creation time.
+
+Each successful dispatch must return the upstream acknowledgement shape `{ "sequence": number }`.
+The MCP result reports acknowledgement separately from completion and never fabricates a `turnId`.
+If the first turn dispatch fails after creation, the result retains the thread id. Transport or invalid
+acknowledgement failures are `unknown`; the connector never automatically replays either mutation.
+
 ## Verification
 
 The automated tests run an actual MCP client against the stdio connector and controlled HTTP
 servers implementing this contract. They cover descriptor and token exchange, invalid grants,
 restart persistence, failed replacement, two-environment registration isolation, project discovery,
-thread status mapping, bounded pagination, malformed and insecure URLs, redaction, owner-only
-storage, and redirect rejection.
+thread status mapping, bounded pagination, first-turn acknowledgement and failure handling, malformed
+and insecure URLs, redaction, owner-only storage, and redirect rejection.
 
 A live direct-pairing smoke check against a real T3 environment without Connect is not recorded
 in this repository: this workspace has no operator-provided environment endpoint and grant.
