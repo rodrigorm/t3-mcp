@@ -1,7 +1,9 @@
 # Upstream compatibility
 
-The connector implements the direct environment contract evidenced by T3 Code commit
-`7445aa733ada33e45289e5aa5055f79142556513`.
+The connector implements the environment and Desktop Connect contracts evidenced by T3 Code
+`d5980a0ff1511e6ae1f1876406a7c45a7a989cdb` and comparison pin
+`7445aa733ada33e45289e5aa5055f79142556513`. Immutable Clerk/OpenAPI evidence is recorded in
+[the Desktop authentication contract](connect-auth-contract.md).
 
 ## Pairing contract
 
@@ -27,22 +29,21 @@ the exchange. The bearer session is stored privately for later workflow slices.
 
 ## Experimental T3 Connect contract
 
-Connect is optional and does not replace direct pairing. `connect_authenticate` starts a local callback
-flow using the configured Clerk OAuth token endpoint and a PKCE verifier; the browser authorization URL
-and status are public, while tokens and the DPoP private key remain in the separate owner-only Connect
-state file.
+Connect is optional and does not replace direct pairing. `connect_authenticate` returns a
+connector-owned loopback login URL. Node creates its own native Clerk client, stores response
+Authorization rotations privately and drives the existing-account sign-in statuses and offered
+email-code/password factors. Offered second factors/client-trust verification must complete.
+Unsupported strategies, session tasks or challenges report specific recovery guidance.
 
 After authentication, `list_connect_environments` uses the Connect relay for discovery only. The
-connector never saves a discovered environment implicitly. The hosted OAuth flow has no verified
-handoff for the relay-audience JWT required for registration at the pin and inspected current
-targets `c2fa9fc911daeac97df4760f95fc57dca42b84c8` and
-`35be904f2fc40aa6d7a42778b6895e8274f3097f`. The latter was resolved from `main` during
-#16 on 2026-09-30. Their relay token exchange handler and hosted authorize builder are
-identical to the pin. This inspection does not verify the entire current orchestration contract.
-An incompatible subject produces sanitized
-`upstream_incompatible` recovery guidance. See [registration contract and blocker](connect-registration-contract.md).
+connector never saves a discovered environment implicitly. The public native session-template
+endpoint supplies the relay-audience JWT. Authentication completes only after the owned
+session/account checks and relay discovery succeed. The native client credential and cached
+template JWT/expiry are separate; restart verifies ownership and renews through Clerk. No CLI
+OAuth code exchange, refresh token or upstream handoff is required. See
+[registration contract](connect-registration-contract.md).
 
-Against a contract-compatible controlled issuer, `register_connect_environment` or
+After Desktop-native authentication, `register_connect_environment` or
 `attach_connect_environment` explicitly selects an environment, requests a relay DPoP-bound credential,
 and exchanges that credential at the environment's `/oauth/token` endpoint with a DPoP proof key.
 Connect environment requests use the resulting DPoP access token and proof; direct environment requests
@@ -112,13 +113,13 @@ queue a call.
 ## Support statement
 
 The implemented direct environment and orchestration contract is protocol version `1` at upstream
-commit `7445aa733ada33e45289e5aa5055f79142556513`. Connect is optional/experimental and blocked on
-the hosted OAuth-to-relay authorization contract. The automated fixtures advertise server version `0.0.42`;
+commits listed above. Connect is optional/experimental; the remaining real deployment check needs
+operator-authorized resources. The automated fixtures advertise server version `0.0.42`;
 the public MCP tests exercise pairing, Connect authentication and
 discovery, explicit registration and attachment, sign-out, unregistration, dispatch, observation,
 pagination, authorization failures, and ambiguous mutation outcomes. This is tested protocol
 behavior, not a claim that the fixture's server version is a currently deployed T3 release or that
-hosted Connect registration works.
+production Connect registration was exercised.
 
 ## Verification
 
@@ -141,15 +142,18 @@ either former endpoint, verifies another registration's usability, and checks re
 login/discovery. The packaged generic direct
 and Connect runners use that same installed MCP/HTTP boundary. Runner tests cover explicit targets,
 both registration modes, lifecycle checks, blocked/unknown stops without replay, stale-completion
-rejection, redacted summaries, and isolation from existing state. Fixture JWT issuance does not
-establish a hosted OAuth handoff or complete the live gate.
+rejection, redacted summaries, and isolation from existing state. Native auth coverage includes
+header rotations on every FAPI response, single-session ownership, factors/client trust,
+short-template renewal without re-login, account pinning, revoked sessions, secret reflection,
+restart, configuration association, obsolete OAuth migration and concurrent cancellation/CAS.
+Fixture success does not complete the real operator smoke.
 
 Unauthenticated production relay metadata returned HTTP 200 on 2026-09-30 and matched the exact
 relay issuer/resource, token endpoint, and ES256/DPoP declarations. No credentialed request or
-live OAuth, registration, attachment, or turn was attempted. #15's local attachment fixes are
-implemented. The remaining blocker is the upstream authorization handoff and unavailable
-operator resources. Connect stays EXPERIMENTAL and #16 remains incomplete. See
-[repeatable smoke instructions and blocked evidence](smoke-live.md).
+live login, registration, attachment, or turn was attempted. The earlier claim that Desktop
+login needs upstream authorization changes was incorrect. The public native FAPI and
+session-template contract provides that login. Connect stays EXPERIMENTAL and the real
+operator smoke remains unperformed. See [repeatable smoke instructions](smoke-live.md).
 
 A live direct-pairing or Connect smoke check against a real T3 environment was not run for this release
 because this workspace has no operator-authorized environment endpoint, grant, or Connect account. No

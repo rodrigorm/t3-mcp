@@ -45,10 +45,10 @@ host-neutral and uses MCP tools rather than shell commands.
    `connect_authenticate` with `action=status` until authenticated, then call
    `list_connect_environments`. Discovery does not save environments; call
    `register_connect_environment` for a new saved environment or `attach_connect_environment` for
-   an existing direct registration. Registration and attachment currently have an upstream
-   authentication blocker; hosted OAuth does not provide a verified relay-audience JWT handoff.
-   Use direct pairing while that contract is unresolved. See
-   [the registration blocker](docs/connect-registration-contract.md).
+    an existing direct registration. Open the returned loopback URL on the connector host.
+    Enter your identifier, password or verification codes only in that page. The connector
+    creates its own native Clerk client/session and verifies its `t3-relay` JWT with the relay.
+    See [the Desktop authentication contract](docs/connect-auth-contract.md).
 3. Call `list_environments`, select an explicit environment `id`, then call `list_projects` with
    that id. Project and thread identifiers are scoped to the selected environment.
 4. Use `start_turn` with `environmentId`, `projectId`, and `prompt` for a new thread. Use
@@ -63,10 +63,18 @@ host-neutral and uses MCP tools rather than shell commands.
    referenced thread with `get_thread` first; only then decide whether a retry is safe. Mutation
    requests are never automatically replayed.
 
-Connect configuration is supplied through the host environment: set
-`T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_CLIENT_ID`, and either
-`T3_MCP_CONNECT_TOKEN_ENDPOINT` or a Clerk publishable key. Keep these values outside the repository;
-the hosted authorization page defaults to `https://app.t3.codes`.
+Connect uses the public Desktop defaults: Clerk key `pk_live_Y2xlcmsudDMuY29kZXMk`, template
+`t3-relay` and relay `https://relay.t3.codes`. Optional overrides are
+`T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY`, `T3_MCP_CONNECT_CLERK_JWT_TEMPLATE`,
+`T3_MCP_CONNECT_FRONTEND_API_URL` and `T3_MCP_CONNECT_RELAY_URL`.
+`T3_MCP_CONNECT_CALLBACK_PORT` defaults to an OS-assigned loopback UI port. No CLI OAuth
+client ID or token endpoint is needed.
+
+The existing-account UI follows Clerk's offered email-code/password first factors and
+authenticator, backup, SMS or email second factors/client-trust verification. Unsupported
+social/SSO, passkey, reset, registration, session-task and challenge steps report specific
+recovery guidance. Configure an allowed factor in T3 account settings before retrying.
+The connector never captures installed Desktop callbacks or copies host login tokens.
 
 After adoption, normal turns use these MCP tools. A local turn CLI, if one is available in a host,
 is an optional debugging utility; this package never invokes `t3-turn`.
@@ -125,6 +133,11 @@ and an ambiguous transport result is `unknown` so the caller can inspect the thr
 - Redirects are rejected, so credentials are never forwarded to another origin.
 - Environment and Connect state are separate files outside the repository, owner-only, and atomically
   replaced. Connect access uses DPoP-bound keys and environment access is never included in MCP output.
+- The native Client API credential and cached template JWT have separate lifecycles. Restart
+  verifies the owned session and renews through the public session-template API. Stored native
+  state is plaintext with private permissions; run one connector process per state directory.
+- Obsolete OAuth login state requires native reauthentication. Saved environment access and
+  proof keys survive migration. Account switching requires explicit Connect sign-out.
 - A failed re-pair leaves the existing registration unchanged.
 
 ## Compatibility and evidence
@@ -133,16 +146,16 @@ See [`docs/compatibility.md`](docs/compatibility.md) for the upstream version an
 descriptor, token exchange, scopes, and session checks used by this package.
 
 Automated compatibility coverage runs an MCP client against the connector process and controlled
-HTTP environments implementing the direct-pairing and controlled relay-JWT contracts. Tests include
+HTTP environments implementing public native Clerk, direct-pairing and relay-JWT contracts. Tests include
 cryptographic DPoP validation, installed-package turns for registration and attachment, lifecycle
-isolation across restart, and the packaged smoke runners. They do not prove the hosted
-OAuth handoff or complete the live Connect ticket. No live direct-pairing
+isolation across restart, supported factors/client trust, client rotations, template renewal,
+and the packaged smoke runners. No live direct-pairing
 or Connect smoke check was run for this release because this workspace has no operator-authorized
 environment or Connect account; controlled checks must not be read as a claim that a live T3 deployment
 was exercised.
 
 For repeatable installed-package verification, see [`docs/smoke-live.md`](docs/smoke-live.md).
 The optional runners require explicit targets and use fresh disposable state. They print only
-public browser authorization URLs and safe summary codes. Direct pairing remains the default;
-the Connect live run is blocked on the upstream JWT handoff and operator-authorized resources.
+local browser authorization URLs and safe summary codes. Direct pairing remains the default.
+The remaining real Connect smoke requires operator login and authorized remote machines/project.
 Public metadata checks and automated fixtures are recorded separately from live evidence.

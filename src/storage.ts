@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { closeSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -268,16 +269,23 @@ export class EnvironmentStore {
 }
 
 export interface ConnectAuth {
+  /** Cached short-lived template JWT, never the native Client API credential. */
   readonly accessToken: string;
-  readonly refreshToken: string;
+  readonly nativeClientToken: string;
+  readonly sessionId: string;
+  readonly frontendApiUrl: string;
+  readonly publishableKey: string;
+  readonly jwtTemplate: string;
+  readonly relayUrl: string;
   readonly expiresAt: string;
   readonly accountId?: string;
   readonly dpopPrivateJwk: DpopPrivateJwk;
 }
 
 interface ConnectStoreFile {
-  readonly version: 1;
+  readonly version: 2;
   readonly auth?: ConnectAuth;
+  readonly pendingNative?: { readonly token: string; readonly frontendApiUrl: string };
 }
 
 function isConnectAuth(value: unknown): value is ConnectAuth {
@@ -285,9 +293,13 @@ function isConnectAuth(value: unknown): value is ConnectAuth {
   const auth = value as Record<string, unknown>;
   return (
     typeof auth.accessToken === "string" &&
-    auth.accessToken.length > 0 &&
     !/\s/.test(auth.accessToken) &&
-    typeof auth.refreshToken === "string" &&
+    typeof auth.nativeClientToken === "string" && !/\s/.test(auth.nativeClientToken) &&
+    typeof auth.sessionId === "string" &&
+    typeof auth.frontendApiUrl === "string" &&
+    typeof auth.publishableKey === "string" &&
+    typeof auth.jwtTemplate === "string" &&
+    typeof auth.relayUrl === "string" &&
     typeof auth.expiresAt === "string" &&
     Number.isFinite(Date.parse(auth.expiresAt)) &&
     isDpopPrivateJwk(auth.dpopPrivateJwk) &&
@@ -302,9 +314,18 @@ export class ConnectStore {
   private credentialRevision = 0;
   private readonly snapshots = new WeakMap<ConnectAuth, number>();
   private mutations: Promise<unknown> = Promise.resolve();
+  private owner: string | undefined;
 
   get generation(): number {
     return this.revision;
+  }
+
+  assertOwner(): void {
+    if (!this.owner) return;
+    try {
+      if (readFileSync(path.join(this.directory, ".connect-owner"), "utf8") === this.owner) return;
+    } catch { /* The credential lease was lost. */ }
+    throw new ConnectorError("storage_error", "Connect credential ownership changed; restart with a private state directory.");
   }
 
   constructor(directory = defaultStateDirectory()) {
@@ -332,8 +353,22 @@ export class ConnectStore {
     }
 
     try {
-      const parsed = JSON.parse(raw) as ConnectStoreFile;
-      if (parsed.version !== 1 || (parsed.auth !== undefined && !isConnectAuth(parsed.auth))) {
+      let parsed = JSON.parse(raw) as ConnectStoreFile;
+      // CLI OAuth state cannot renew a Desktop session. Keep its account pin, but
+      // discard the obsolete credentials. Environment sessions live in another file.
+      if ((parsed as { version: number }).version === 1) {
+        const legacy = parsed.auth as unknown as Record<string, unknown> | undefined;
+        if (legacy && (!isDpopPrivateJwk(legacy.dpopPrivateJwk) ||
+          (legacy.accountId !== undefined && typeof legacy.accountId !== "string"))) throw invalidStore();
+        parsed = { version: 2, ...(legacy ? { auth: {
+          accessToken: "", nativeClientToken: "", sessionId: "", frontendApiUrl: "", publishableKey: "",
+          jwtTemplate: "", relayUrl: "", expiresAt: new Date(0).toISOString(),
+          dpopPrivateJwk: legacy.dpopPrivateJwk as DpopPrivateJwk,
+          ...(typeof legacy.accountId === "string" ? { accountId: legacy.accountId } : {}),
+        } } : {}) };
+        await this.write(parsed);
+      }
+      if (parsed.version !== 2 || (parsed.auth !== undefined && !isConnectAuth(parsed.auth))) {
         throw invalidStore();
       }
       if (parsed.auth) this.snapshots.set(parsed.auth, this.credentialRevision);
@@ -350,9 +385,9 @@ export class ConnectStore {
       const previous = await this.readCurrent();
       if (expected && (this.snapshots.get(expected) !== this.credentialRevision ||
         JSON.stringify(previous) !== JSON.stringify(expected))) return false;
-      const active = () => generation === this.revision;
+      const active = () => { this.assertOwner(); return generation === this.revision; };
       if (!active()) return false;
-      if (!(await this.write({ version: 1, auth }, active))) return false;
+      if (!(await this.write({ version: 2, auth }, active))) return false;
       if (active()) {
         this.credentialRevision += 1;
         this.snapshots.set(auth, this.credentialRevision);
@@ -360,7 +395,7 @@ export class ConnectStore {
       }
       // Restore the retained login if cancellation raced with rename. All readers
       // wait for this serialized mutation, including its restoration.
-      if (previous) await this.write({ version: 1, auth: previous });
+      if (previous) await this.write({ version: 2, auth: previous });
       else await rm(this.filePath, { force: true });
       return false;
     });
@@ -369,6 +404,28 @@ export class ConnectStore {
   invalidateWrites(): Promise<void> {
     this.revision += 1;
     return this.mutations.then(() => undefined);
+  }
+
+  async stageNative(token: string, frontendApiUrl: string, generation: number): Promise<boolean> {
+    return this.mutate(async () => {
+      if (generation !== this.revision) return false;
+      const auth = await this.readCurrent();
+      const active = () => generation === this.revision;
+      if (!(await this.write({ version: 2, ...(auth ? { auth } : {}), pendingNative: { token, frontendApiUrl } }, active))) return false;
+      if (active()) return true;
+      if (auth) await this.write({ version: 2, auth });
+      else await rm(this.filePath, { force: true });
+      return false;
+    });
+  }
+
+  async discardPending(generation = this.revision): Promise<void> {
+    return this.mutate(async () => {
+      if (generation !== this.revision) return;
+      const auth = await this.readCurrent();
+      if (auth) await this.write({ version: 2, auth });
+      else await rm(this.filePath, { force: true });
+    });
   }
 
   async clear(): Promise<boolean> {
@@ -418,5 +475,40 @@ export class ConnectStore {
 
   private async ensureDirectory(): Promise<void> {
     await ensurePrivateDirectory(this.directory);
+    this.acquireOwner();
+  }
+
+  private acquireOwner(): void {
+    if (this.owner) { this.assertOwner(); return; }
+    const lock = path.join(this.directory, ".connect-owner");
+    const value = JSON.stringify({ pid: process.pid, nonce: randomUUID() });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const descriptor = openSync(lock, "wx", 0o600);
+        try { writeFileSync(descriptor, value); } finally { closeSync(descriptor); }
+        this.owner = value;
+        process.once("exit", () => {
+          try { if (readFileSync(lock, "utf8") === value) unlinkSync(lock); } catch { /* Already released. */ }
+        });
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw invalidStore();
+        try {
+          const file = lstatSync(lock);
+          if (!file.isFile() || file.isSymbolicLink() || !isPrivateMode(file.mode)) throw invalidStore();
+          const retained = readFileSync(lock, "utf8");
+          const pid = (JSON.parse(retained) as { pid?: unknown }).pid;
+          if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) throw invalidStore();
+          try { process.kill(pid, 0); }
+          catch (probe) {
+            if ((probe as NodeJS.ErrnoException).code === "ESRCH" && readFileSync(lock, "utf8") === retained) {
+              unlinkSync(lock); continue;
+            }
+          }
+        } catch (failure) { if ((failure as NodeJS.ErrnoException).code === "ENOENT") continue; }
+        throw new ConnectorError("storage_error", "Connect credentials are owned by another connector process or unavailable; use one process per private state directory.");
+      }
+    }
+    throw invalidStore();
   }
 }

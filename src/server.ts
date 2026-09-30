@@ -149,7 +149,7 @@ const addInputSchema = z.object({
   environmentId: z.string().trim().min(1).max(512).optional(),
 });
 
-const connectAuthInputSchema = z.object({
+const connectAuthInputSchema = z.strictObject({
   action: z.enum(["start", "status", "cancel"]).optional(),
 });
 const registerConnectInputSchema = z.object({
@@ -247,7 +247,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
     "connect_authenticate",
     {
       description:
-        "Start, inspect, or cancel operator-driven T3 Connect browser authentication without returning credentials.",
+        "Start, inspect, or cancel Desktop-native T3 Connect authentication. Open the local browser URL; enter identifiers, passwords and codes only in that page.",
       inputSchema: connectAuthInputSchema,
       outputSchema: connectAuthResultSchema,
       annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },

@@ -10,10 +10,10 @@ private bot convention. Direct pairing is always available; T3 Connect is an opt
 path. Select the operator's exact environment and project; deployment-specific defaults are not
 part of this skill.
 
-Connect is EXPERIMENTAL. If registration or attachment reports `upstream_incompatible` for the
-relay-audience JWT, use direct pairing or report the upstream authorization blocker.
-Hosted OAuth login/discovery does not prove registration authorization. Keep credentials
-in the connector's private exchanges; do not export browser/host tokens or keys through MCP.
+Connect is EXPERIMENTAL and uses Desktop-native Clerk authentication. The operator enters
+identifiers, passwords and verification codes only in the returned local browser page.
+Keep credentials in the connector's private exchanges. On `upstream_incompatible`, report
+the sanitized error and consult [the auth contract](../../docs/connect-auth-contract.md).
 
 ## Tools
 
@@ -71,7 +71,7 @@ registration; select an environment explicitly, then register or attach it befor
 ## Register or attach Connect access
 
 1. For operator-requested Connect access, start `connect_authenticate`, have the operator open
-   its public authorization URL on the connector host, and poll with `action=status` until
+   its loopback authorization URL on the connector host, and poll with `action=status` until
    `authenticated`. On failed or cancelled status, report the sanitized code and stop. Discovery
    and registration require authentication; an existing valid environment session does not.
 2. Call `list_environments` and `list_connect_environments`. Discovery must leave saved
@@ -80,7 +80,7 @@ registration; select an environment explicitly, then register or attach it befor
    For operator-requested attachment to a saved registration, match its saved `id` to the
    discovered `id` exactly and call `attach_connect_environment` with that identity as both
    `environmentId` and `targetEnvironmentId`. Matching labels alone are insufficient. Omit
-   `label` to preserve the saved label. Stop on the upstream authorization blocker.
+    `label` to preserve the saved label. Stop on identity, authorization or compatibility errors.
 4. Confirm that `list_environments` contains one registration for that id with Connect access.
    For attachment, require `connectAttached: true` and an unchanged stable id. Use that same
    `environmentId` for project and turn tools. Attachment selects Connect access and retains

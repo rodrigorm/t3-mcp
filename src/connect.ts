@@ -1,302 +1,115 @@
-import { createHash, randomBytes } from "node:crypto";
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse, type Server as HttpServer } from "node:http";
-
 import { ConnectorError } from "./errors.js";
 import { createDpopProof, dpopThumbprint, generateDpopKey } from "./dpop.js";
 import { ConnectStore, type ConnectAuth } from "./storage.js";
 import { safePayload } from "./secrets.js";
 import { pairConnectEnvironment } from "./upstream.js";
 import { parseEndpoint } from "./url.js";
+import { NativeClerk, type NativeConfig, type LoginView } from "./native-clerk.js";
+import { localLogin, type LocalLogin } from "./local-login.js";
 import type { DpopPrivateJwk, PairingResult } from "./types.js";
 
-const REQUEST_TIMEOUT_MS = 10_000;
 const AUTH_TIMEOUT_MS = 10 * 60 * 1_000;
-const AUTH_REFRESH_WINDOW_MS = 60_000;
 const TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
-const RELAY_JWT_SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt";
 const RELAY_ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
 
 export type ConnectAuthState = "signed_out" | "pending" | "authenticated" | "failed" | "cancelled";
-
 export interface PublicConnectAuth {
   readonly status: ConnectAuthState;
   readonly authorizationUrl?: string;
   readonly expiresAt?: string;
   readonly error?: { readonly code: string; readonly message: string };
 }
-
 export interface ConnectEnvironment {
   readonly id: string;
   readonly label: string;
   readonly endpoint: string;
   readonly linkedAt: string;
 }
-
-interface ConnectConfig {
-  readonly relayUrl: string;
-  readonly tokenEndpoint: string;
-  readonly hostedAppUrl: string;
-  readonly clientId: string;
+interface ConnectConfig extends NativeConfig {
   readonly relayClientId: "t3-web" | "t3-mobile";
   readonly callbackPort: number;
 }
-
 interface PendingAuthorization {
-  readonly state: string;
-  readonly verifier: string;
-  readonly authorizationUrl: string;
+  readonly ui: LocalLogin;
   readonly expiresAt: string;
   readonly key: DpopPrivateJwk;
-  readonly server: HttpServer;
   readonly timer: NodeJS.Timeout;
   readonly generation: number;
-  exchanging: boolean;
-}
-
-interface OAuthToken {
-  readonly accessToken: string;
-  readonly refreshToken: string;
-  readonly expiresAt: string;
-  readonly accountId: string;
-  readonly idToken?: string;
+  readonly clerk: NativeClerk;
 }
 
 function firstSetting(...names: string[]): string | undefined {
-  for (const name of names) {
-    const value = process.env[name]?.trim();
-    if (value) return value;
-  }
+  for (const name of names) { const value = process.env[name]?.trim(); if (value) return value; }
   return undefined;
 }
-
-function requiredSetting(name: string, ...names: string[]): string {
-  const value = firstSetting(name, ...names);
-  if (!value) throw new ConnectorError("connect_not_configured", "T3 Connect is not configured.");
-  return value;
-}
-
 function normalizedUrl(value: string, allowLoopbackHttp: boolean): string {
-  let url: URL;
   try {
-    url = new URL(value);
-  } catch {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
-  }
-  const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname.toLowerCase());
-  if (url.protocol !== "https:" && !(allowLoopbackHttp && loopback && url.protocol === "http:")) {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
-  }
-  if (url.username || url.password || url.search || url.hash || url.pathname !== "/") {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
-  }
-  url.pathname = "/";
-  return url.toString();
+    const url = new URL(value);
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname.toLowerCase());
+    if (url.protocol !== "https:" && !(allowLoopbackHttp && loopback && url.protocol === "http:")) throw new Error();
+    if (url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new Error();
+    return url.toString();
+  } catch { throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid."); }
 }
-
-function configuredUrl(value: string, allowLoopbackHttp: boolean, preservePath: boolean): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
-  }
-  const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname.toLowerCase());
-  if (url.protocol !== "https:" && !(allowLoopbackHttp && loopback && url.protocol === "http:")) {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
-  }
-  if (url.username || url.password || url.search || url.hash) {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
-  }
-  if (!preservePath) url.pathname = "/";
-  return url.toString();
-}
-
-function tokenEndpointFromPublishableKey(key: string): string {
-  const encoded = key.split("_").slice(2).join("_");
-  try {
-    const hostname = Buffer.from(encoded, "base64").toString("utf8").replace(/\$$/, "");
-    if (!hostname || hostname.includes("/") || hostname.includes(" ")) throw new Error();
-    return `https://${hostname}/oauth/token`;
-  } catch {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect authentication configuration is invalid.");
-  }
-}
-
 function config(): ConnectConfig {
-  const callbackPortSetting = firstSetting("T3_MCP_CONNECT_CALLBACK_PORT") ?? "34338";
-  const callbackPort = Number(callbackPortSetting);
-  if (!/^\d{1,5}$/.test(callbackPortSetting) || callbackPort > 65535) {
-    throw new ConnectorError("connect_not_configured", "The T3 Connect callback port configuration is invalid.");
-  }
-  const relayUrl = normalizedUrl(
-    requiredSetting("T3_MCP_CONNECT_RELAY_URL", "T3_MCP_RELAY_URL", "T3CODE_RELAY_URL"),
-    true,
-  );
-  const tokenEndpoint = configuredUrl(
-    firstSetting("T3_MCP_CONNECT_TOKEN_ENDPOINT") ??
-      tokenEndpointFromPublishableKey(
-        requiredSetting(
-          "T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY",
-          "T3_MCP_CLERK_PUBLISHABLE_KEY",
-          "T3CODE_CLERK_PUBLISHABLE_KEY",
-        ),
-      ),
-    true,
-    true,
-  );
-  const hostedAppUrl = configuredUrl(
-    firstSetting("T3_MCP_CONNECT_HOSTED_APP_URL", "T3_MCP_HOSTED_APP_URL", "T3CODE_HOSTED_APP_URL") ??
-      "https://app.t3.codes",
-    false,
-    false,
-  );
+  const port = firstSetting("T3_MCP_CONNECT_CALLBACK_PORT") ?? "0";
+  if (!/^\d{1,5}$/.test(port) || Number(port) > 65535) throw new ConnectorError("connect_not_configured", "The local Connect UI port configuration is invalid.");
+  const publishableKey = firstSetting("T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY", "T3_MCP_CLERK_PUBLISHABLE_KEY", "T3CODE_CLERK_PUBLISHABLE_KEY") ?? "pk_live_Y2xlcmsudDMuY29kZXMk";
+  let frontendHost: string;
+  try {
+    if (!/^pk_(live|test)_/.test(publishableKey)) throw new Error();
+    frontendHost = Buffer.from(publishableKey.split("_").slice(2).join("_"), "base64").toString("utf8");
+    if (!/^[a-zA-Z0-9.-]+\$$/.test(frontendHost)) throw new Error();
+  } catch { throw new ConnectorError("connect_not_configured", "The Clerk publishable key configuration is invalid."); }
+  const jwtTemplate = firstSetting("T3_MCP_CONNECT_CLERK_JWT_TEMPLATE", "T3CODE_CLERK_JWT_TEMPLATE") ?? "t3-relay";
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(jwtTemplate)) throw new ConnectorError("connect_not_configured", "The Clerk JWT template configuration is invalid.");
   return {
-    relayUrl,
-    tokenEndpoint,
-    hostedAppUrl,
-    clientId: requiredSetting(
-      "T3_MCP_CONNECT_CLIENT_ID",
-      "T3_MCP_CLERK_CLIENT_ID",
-      "T3CODE_CLERK_CLI_OAUTH_CLIENT_ID",
-    ),
+    publishableKey, jwtTemplate,
+    frontendApiUrl: normalizedUrl(firstSetting("T3_MCP_CONNECT_FRONTEND_API_URL") ?? `https://${frontendHost.slice(0, -1)}`, true),
+    relayUrl: normalizedUrl(firstSetting("T3_MCP_CONNECT_RELAY_URL", "T3_MCP_RELAY_URL", "T3CODE_RELAY_URL") ?? "https://relay.t3.codes", true),
     relayClientId: firstSetting("T3_MCP_RELAY_CLIENT_ID") === "t3-mobile" ? "t3-mobile" : "t3-web",
-    callbackPort,
+    callbackPort: Number(port),
   };
 }
-
-function base64Url(value: string | Uint8Array): string {
-  return Buffer.from(value).toString("base64url");
+function associated(auth: ConnectAuth, settings: NativeConfig): boolean {
+  return ["frontendApiUrl", "publishableKey", "jwtTemplate", "relayUrl"].every((key) =>
+    auth[key as keyof NativeConfig] === settings[key as keyof NativeConfig]);
 }
-
-function decodeJwtSubject(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const part = value.split(".")[1];
-  if (!part) return undefined;
-  try {
-    const claims = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as Record<string, unknown>;
-    return typeof claims.sub === "string" && claims.sub.trim() ? claims.sub.trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function oauthChallenge(verifier: string): string {
-  return base64Url(requireHash(verifier));
-}
-
-function requireHash(value: string): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(value).digest());
-}
-
-function randomBase64Url(bytes: number): string {
-  return base64Url(randomBytes(bytes));
-}
-
 function publicAuth(status: ConnectAuthState, pending?: PendingAuthorization, error?: { code: string; message: string }): PublicConnectAuth {
-  return {
-    status,
-    ...(pending
-      ? { authorizationUrl: pending.authorizationUrl, expiresAt: pending.expiresAt }
-      : {}),
-    ...(error ? { error } : {}),
-  };
+  return { status, ...(pending ? { authorizationUrl: pending.ui.authorizationUrl, expiresAt: pending.expiresAt } : {}), ...(error ? { error } : {}) };
 }
-
-function safeAuthFailure(code: "connect_auth_failed" | "connect_auth_expired" | "connect_auth_cancelled", message: string): ConnectorError {
-  return new ConnectorError(code, message);
-}
-
-async function closeServer(server: HttpServer): Promise<void> {
-  if (!server.listening) return;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-}
-
-async function listen(server: HttpServer, port: number): Promise<number> {
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(port, "127.0.0.1", () => resolve());
-    });
-  } catch {
-    throw new ConnectorError("connect_auth_failed", "The local Connect callback could not start; check that its configured port is available.");
-  }
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    await closeServer(server);
-    throw new ConnectorError("connect_auth_failed", "The local Connect callback could not start.");
-  }
-  return address.port;
-}
-
 async function responseJson(response: Response): Promise<unknown> {
-  try {
-    return await response.json();
-  } catch {
-    throw new ConnectorError("upstream_incompatible", "T3 Connect returned invalid JSON.");
-  }
+  try { return await response.json(); } catch { throw new ConnectorError("upstream_incompatible", "T3 Connect returned invalid JSON."); }
 }
-
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-  try {
-    return await fetch(url, {
-      ...init,
-      redirect: "error",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-  } catch {
-    throw new ConnectorError("connect_unavailable", "T3 Connect could not be reached safely.");
-  }
+  try { return await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(10_000) }); }
+  catch { throw new ConnectorError("connect_unavailable", "T3 Connect could not be reached safely."); }
 }
-
 function connectErrorForStatus(status: number): ConnectorError {
   if (status === 401) return new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
   if (status === 403) return new ConnectorError("connect_permission_denied", "T3 Connect denied this operation.");
   if (status === 404) return new ConnectorError("connect_environment_not_found", "The selected Connect environment is unavailable.");
-  if (status >= 500) return new ConnectorError("connect_unavailable", "T3 Connect is temporarily unavailable.");
-  return new ConnectorError("connect_unavailable", "T3 Connect rejected the request.");
+  return new ConnectorError("connect_unavailable", status >= 500 ? "T3 Connect is temporarily unavailable." : "T3 Connect rejected the request.");
 }
-
 function parseConnectEnvironment(value: unknown, secrets: readonly string[]): ConnectEnvironment {
   if (!value || typeof value !== "object") throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment.");
   safePayload(value, secrets);
   const environment = value as Record<string, unknown>;
-  const endpoint = environment.endpoint;
-  if (
-    typeof environment.environmentId !== "string" ||
-    !environment.environmentId.trim() ||
-    typeof environment.label !== "string" ||
-    !environment.label.trim() ||
-    typeof environment.linkedAt !== "string" ||
-    !environment.linkedAt.trim() ||
-    !endpoint ||
-    typeof endpoint !== "object"
-  ) {
-    throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment.");
-  }
-  const endpointRecord = endpoint as Record<string, unknown>;
-  if (
-    typeof endpointRecord.httpBaseUrl !== "string" ||
-    typeof endpointRecord.wsBaseUrl !== "string" ||
-    typeof endpointRecord.providerKind !== "string" ||
-    !["manual", "cloudflare_tunnel", "t3_relay"].includes(endpointRecord.providerKind)
-  ) {
+  const endpoint = environment.endpoint as Record<string, unknown> | undefined;
+  if (typeof environment.environmentId !== "string" || !environment.environmentId.trim() ||
+    typeof environment.label !== "string" || !environment.label.trim() ||
+    typeof environment.linkedAt !== "string" || !environment.linkedAt.trim() || !endpoint || typeof endpoint !== "object" ||
+    typeof endpoint.httpBaseUrl !== "string" || typeof endpoint.wsBaseUrl !== "string" ||
+    !["manual", "cloudflare_tunnel", "t3_relay"].includes(String(endpoint.providerKind))) {
     throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment endpoint.");
   }
-  let httpBaseUrl: string;
   try {
-    httpBaseUrl = normalizedUrl(endpointRecord.httpBaseUrl, true);
-    const wsUrl = new URL(endpointRecord.wsBaseUrl);
-    if (!["ws:", "wss:"].includes(wsUrl.protocol)) throw new Error();
-    normalizedUrl(wsUrl.toString().replace(/^ws/, "http"), true);
-  } catch {
-    throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment endpoint.");
-  }
-  return {
-    id: environment.environmentId.trim(),
-    label: environment.label.trim(),
-    endpoint: httpBaseUrl,
-    linkedAt: environment.linkedAt,
-  };
+    const httpBaseUrl = normalizedUrl(endpoint.httpBaseUrl, true);
+    const ws = new URL(endpoint.wsBaseUrl);
+    if (!["ws:", "wss:"].includes(ws.protocol)) throw new Error();
+    normalizedUrl(ws.toString().replace(/^ws/, "http"), true);
+    return { id: environment.environmentId.trim(), label: environment.label.trim(), endpoint: httpBaseUrl, linkedAt: environment.linkedAt };
+  } catch { throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment endpoint."); }
 }
 
 export class ConnectManager {
@@ -305,6 +118,7 @@ export class ConnectManager {
   private lifecycle = 0;
   private starting: Promise<PublicConnectAuth> | undefined;
   private readonly secrets = new Set<string>();
+  private validatedSession: string | undefined;
   private refreshing: { readonly generation: number; readonly token: Promise<ConnectAuth> } | undefined;
 
   constructor(private readonly store: ConnectStore) {}
@@ -315,11 +129,7 @@ export class ConnectManager {
     if (this.starting) return this.starting;
     const starting = this.startAuthentication();
     this.starting = starting;
-    try {
-      return await starting;
-    } finally {
-      if (this.starting === starting) this.starting = undefined;
-    }
+    try { return await starting; } finally { if (this.starting === starting) this.starting = undefined; }
   }
 
   private async startAuthentication(): Promise<PublicConnectAuth> {
@@ -327,522 +137,267 @@ export class ConnectManager {
     if (this.pending) return publicAuth("pending", this.pending);
     const existing = await this.store.read();
     if (existing) {
-      try {
-        await this.authToken();
-        this.requireLifecycle(lifecycle);
-        return { status: "authenticated" };
-      } catch (error) {
-        if (!(error instanceof ConnectorError) || !["connect_auth_expired", "upstream_incompatible"].includes(error.code)) {
-          throw error;
-        }
+      try { await this.authToken(); this.requireLifecycle(lifecycle); return { status: "authenticated" }; }
+      catch (error) {
+        if (!(error instanceof ConnectorError) || !["connect_auth_expired", "upstream_incompatible"].includes(error.code)) throw error;
       }
     }
     this.requireLifecycle(lifecycle);
-
     await this.store.invalidateWrites();
     this.requireLifecycle(lifecycle);
     const settings = config();
-    const verifier = randomBase64Url(32);
-    const state = randomBase64Url(16);
-    const key = generateDpopKey();
-    const server = createHttpServer((request, response) => {
-      void this.handleCallback(request, response);
-    });
-    const port = await listen(server, settings.callbackPort);
-    if (lifecycle !== this.lifecycle) {
-      await closeServer(server);
-      this.requireLifecycle(lifecycle);
-    }
-    const expiresAt = new Date(Date.now() + AUTH_TIMEOUT_MS).toISOString();
-    const authorizationUrl = new URL("/connect", settings.hostedAppUrl);
-    authorizationUrl.hash = new URLSearchParams([
-      ["state", state],
-      ["challenge", oauthChallenge(verifier)],
-      ["port", String(port)],
-    ]).toString();
-    const pending: PendingAuthorization = {
-      state,
-      verifier,
-      authorizationUrl: authorizationUrl.toString(),
-      expiresAt,
-      key,
-      generation: this.store.generation,
-      exchanging: false,
-      server,
-      timer: setTimeout(() => {
-        void this.finishPending("failed", "connect_auth_expired", "T3 Connect authorization expired; authenticate again.", pending);
-      }, AUTH_TIMEOUT_MS),
-    };
+    const generation = this.store.generation;
+    const assertActive = () => { this.requireLifecycle(lifecycle); this.requireGeneration(generation); };
+    const clerk = new NativeClerk(settings, "", async (token) => {
+      assertActive(); this.secrets.add(token);
+      if (!await this.store.stageNative(token, settings.frontendApiUrl, generation)) this.requireGeneration(-1);
+    }, assertActive);
+    const ui = await localLogin(settings.callbackPort, async (fields) => {
+      assertActive();
+      const pending = this.pending;
+      if (!pending || pending.clerk !== clerk) this.requireGeneration(-1);
+      if (fields.get("action") === "cancel") { await this.cancel(); return { step: "cancelled" }; }
+      try {
+        let view: LoginView;
+        switch (fields.get("action")) {
+          case "identify": {
+            const identifier = fields.get("identifier")?.trim();
+            if (!identifier || identifier.length > 1024) throw new ConnectorError("invalid_input", "Enter an account identifier in this browser.");
+            this.secrets.add(identifier);
+            view = await clerk.identify(identifier); break;
+          }
+          case "choose": view = await clerk.choose(fields.get("strategy") ?? ""); break;
+          case "verify": {
+            const value = fields.get("password") ?? fields.get("code");
+            if (!value || value.length > 1024) throw new ConnectorError("invalid_input", "Enter the requested verification in this browser.");
+            this.secrets.add(value);
+            view = await clerk.verify(value); break;
+          }
+          default: throw new ConnectorError("invalid_input", "Unsupported local login action.");
+        }
+        assertActive();
+        if (view.step === "complete") await this.completeLogin(pending!, settings);
+        return view;
+      } catch (error) {
+        if (error instanceof ConnectorError && this.pending === pending) {
+          this.last = publicAuth("pending", pending, { code: error.code, message: error.message });
+          // Input errors remain retryable. Actual lifecycle/ownership failures end the flow.
+          if (["connect_auth_expired", "connect_account_conflict", "upstream_incompatible"].includes(error.code)) await this.finishPending(error, pending);
+        }
+        throw error;
+      }
+    }, assertActive);
+    if (lifecycle !== this.lifecycle) { ui.close(); this.requireLifecycle(lifecycle); }
+    const pending: PendingAuthorization = { ui, clerk, generation, key: generateDpopKey(),
+      expiresAt: new Date(Date.now() + AUTH_TIMEOUT_MS).toISOString(),
+      timer: setTimeout(() => { void this.finishPending(new ConnectorError("connect_auth_expired", "T3 Connect authorization expired; authenticate again."), pending); }, AUTH_TIMEOUT_MS) };
     this.pending = pending;
     this.last = publicAuth("pending", pending);
     return this.last;
   }
 
-  async status(): Promise<PublicConnectAuth> {
-    if (this.pending) return publicAuth("pending", this.pending);
-    const existing = await this.store.read();
-    if (existing) {
-      if (this.last.status === "failed") return this.last;
-      if (Date.parse(existing.expiresAt) <= Date.now()) {
-        return publicAuth("failed", undefined, {
-          code: "connect_auth_expired",
-          message: "T3 Connect authentication expired; authenticate again.",
-        });
-      }
-      return { status: "authenticated" };
+  private async completeLogin(pending: PendingAuthorization, settings: ConnectConfig): Promise<void> {
+    const active = () => { this.requireGeneration(pending.generation); if (this.pending !== pending) this.requireGeneration(-1); };
+    const owner = await pending.clerk.ownedSession(); active();
+    const existing = await this.store.read(); active();
+    if (existing && (!existing.accountId || existing.accountId !== owner.accountId)) {
+      throw new ConnectorError("connect_account_conflict", "A different T3 Connect account is retained; sign out before switching accounts.");
     }
-    return this.last;
+    const token = await pending.clerk.template(owner.sessionId, owner.accountId); active();
+    this.secrets.add(token.accessToken);
+    const { frontendApiUrl, publishableKey, jwtTemplate, relayUrl } = settings;
+    const auth: ConnectAuth = { frontendApiUrl, publishableKey, jwtTemplate, relayUrl, ...owner, ...token,
+      nativeClientToken: pending.clerk.token, dpopPrivateJwk: pending.key };
+    await this.discover(settings, auth, active); active();
+    if (!await this.store.replace(auth, pending.generation)) this.requireGeneration(-1);
+    active(); this.validatedSession = auth.sessionId; this.stopPending(); this.last = { status: "authenticated" };
+  }
+
+  async status(): Promise<PublicConnectAuth> {
+    if (this.pending) return this.last.status === "pending" ? this.last : publicAuth("pending", this.pending);
+    const existing = await this.store.read();
+    if (!existing) return this.last;
+    if (this.last.status === "failed") return this.last;
+    try { await this.authToken(); return { status: "authenticated" }; }
+    catch (error) {
+      if (!(error instanceof ConnectorError) || error.code === "storage_error") throw error;
+      return publicAuth("failed", undefined, { code: error.code, message: error.message });
+    }
   }
 
   async cancel(): Promise<PublicConnectAuth> {
     this.lifecycle += 1;
     const drained = this.store.invalidateWrites();
-    this.starting = undefined;
-    this.stopPending();
-    const cancelled = publicAuth("cancelled", undefined, {
-      code: "connect_auth_cancelled",
-      message: "T3 Connect authorization was cancelled.",
-    });
+    this.starting = undefined; this.stopPending();
+    const cancelled = publicAuth("cancelled", undefined, { code: "connect_auth_cancelled", message: "T3 Connect authorization was cancelled." });
     this.last = cancelled;
-    await drained;
+    const generation = this.store.generation;
+    await drained; await this.store.discardPending(generation);
     return cancelled;
   }
 
   async signOut(): Promise<{ readonly signedOut: boolean }> {
+    const reading = this.store.read();
     const cancelled = this.cancel();
     const lifecycle = this.lifecycle;
-    this.secrets.clear();
     const clearing = this.store.clear();
+    this.validatedSession = undefined;
+    this.secrets.clear();
+    const existing = await reading;
     await cancelled;
     const signedOut = await clearing;
     if (lifecycle === this.lifecycle && !this.pending) this.last = { status: "signed_out" };
+    // Only end the session we own, with its own native credential/config association.
+    if (existing?.nativeClientToken && existing.sessionId) {
+      try {
+        if (associated(existing, config())) {
+          await new NativeClerk(existing, existing.nativeClientToken, async () => undefined, () => undefined).end(existing.sessionId);
+        }
+      }
+      catch { /* Local logout succeeds even when the remote session is already revoked/unreachable. */ }
+    }
     return { signedOut };
+  }
+
+  private async discover(settings: ConnectConfig, auth: ConnectAuth, active: () => void): Promise<readonly ConnectEnvironment[]> {
+    this.remember(auth);
+    const response = await fetchWithTimeout(`${settings.relayUrl}v1/environments`, { method: "GET", headers: { authorization: `Bearer ${auth.accessToken}` } });
+    active();
+    if (!response.ok) throw connectErrorForStatus(response.status);
+    const value = await responseJson(response); active();
+    if (!value || typeof value !== "object" || !Array.isArray((value as Record<string, unknown>).environments)) throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment list.");
+    return (value as { environments: unknown[] }).environments.map((entry) => parseConnectEnvironment(entry, [...this.secrets]));
   }
 
   async listEnvironments(): Promise<readonly ConnectEnvironment[]> {
     const generation = this.store.generation;
-    const settings = config();
     const auth = await this.authToken();
-    const response = await fetchWithTimeout(`${settings.relayUrl}v1/environments`, {
-      method: "GET",
-      headers: { authorization: `Bearer ${auth.accessToken}` },
-    });
-    this.requireGeneration(generation);
-    if (!response.ok) {
-      if (response.status === 401) await this.invalidateAuth(auth, generation);
-      throw connectErrorForStatus(response.status);
-    }
-    const value = await responseJson(response);
-    this.requireGeneration(generation);
-    if (!value || typeof value !== "object" || !Array.isArray((value as Record<string, unknown>).environments)) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment list.");
-    }
-    const secrets = [...this.secrets, auth.accessToken, auth.refreshToken, auth.dpopPrivateJwk.d];
-    return (value as { environments: unknown[] }).environments.map((entry) => parseConnectEnvironment(entry, secrets));
-  }
-
-  async connectEnvironment(environmentId: string): Promise<{
-    readonly environment: ConnectEnvironment;
-    readonly pairing: PairingResult;
-    readonly accountId?: string;
-    readonly credential: string;
-    readonly assertActive: () => void;
-  }> {
-    const selectedId = environmentId.trim();
-    if (!selectedId) throw new ConnectorError("invalid_input", "environmentId is required.");
-    const settings = config();
-    const generation = this.store.generation;
-    const lifecycle = this.lifecycle;
-    const assertActive = () => {
-      this.requireGeneration(generation);
-      this.requireLifecycle(lifecycle);
-    };
-    const auth = await this.authToken();
-    assertActive();
-    const environments = await this.listEnvironments();
-    assertActive();
-    const environment = environments.find((entry) => entry.id === selectedId);
-    if (!environment) throw new ConnectorError("connect_environment_not_found", "The selected Connect environment is unavailable.");
-
-    const relayToken = await this.relayAccessToken(settings, auth, assertActive);
-    assertActive();
-    const key = auth.dpopPrivateJwk;
-    const connectUrl = `${settings.relayUrl}v1/environments/${encodeURIComponent(selectedId)}/connect`;
-    const connectResponse = await fetchWithTimeout(connectUrl, {
-      method: "POST",
-      headers: {
-        authorization: `DPoP ${relayToken}`,
-        dpop: createDpopProof({ key, method: "POST", url: connectUrl, accessToken: relayToken }),
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ clientProofKeyThumbprint: dpopThumbprint(key) }),
-    });
-    assertActive();
-    if (connectResponse.status === 401) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay proof or session; verify the upstream DPoP contract or use direct pairing.");
-    }
-    if (!connectResponse.ok) throw connectErrorForStatus(connectResponse.status);
-    const value = await responseJson(connectResponse);
-    assertActive();
-    if (!value || typeof value !== "object") {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment credential.");
-    }
-    const result = value as Record<string, unknown>;
-    if (result.environmentId !== selectedId) {
-      throw new ConnectorError("connect_identity_mismatch", "T3 Connect did not prove the selected environment identity; select it again or use direct pairing.");
-    }
-    if (
-      typeof result.credential !== "string" ||
-      !result.credential.trim() ||
-      /\s/.test(result.credential) ||
-      typeof result.expiresAt !== "string" ||
-      !Number.isFinite(Date.parse(result.expiresAt)) || Date.parse(result.expiresAt) <= Date.now()
-    ) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid or expired bootstrap credential; select the environment again or use direct pairing.");
-    }
-    const connectedEnvironment = parseConnectEnvironment({ environmentId: result.environmentId, endpoint: result.endpoint,
-      label: environment.label, linkedAt: environment.linkedAt },
-      [...this.secrets, auth.accessToken, auth.refreshToken, relayToken, result.credential, key.d]);
-    if ((result.endpoint as Record<string, unknown>).providerKind !== "cloudflare_tunnel") {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect registration requires a ready managed cloudflare_tunnel endpoint; use direct pairing for other providers.");
-    }
-    const endpoint = parseEndpoint(
-      connectedEnvironment.endpoint,
-      result.credential,
-    );
-    const pairing = await pairConnectEnvironment(endpoint, key, selectedId, assertActive);
-    assertActive();
-    return {
-      environment: connectedEnvironment,
-      pairing,
-      credential: result.credential,
-      assertActive,
-      ...(auth.accountId ? { accountId: auth.accountId } : {}),
-    };
+    try { return await this.discover(config(), auth, () => this.requireGeneration(generation)); }
+    catch (error) { if (error instanceof ConnectorError && error.code === "connect_auth_expired") await this.invalidateAuth(auth, generation); throw error; }
   }
 
   private async authToken(): Promise<ConnectAuth> {
     const generation = this.store.generation;
     if (this.refreshing?.generation === generation) return this.refreshing.token;
-    const token = this.loadAuthToken(generation);
-    this.refreshing = { generation, token };
-    try {
-      return await token;
-    } catch (error) {
-      if (
-        generation === this.store.generation &&
-        error instanceof ConnectorError &&
-        ["connect_auth_expired", "connect_account_conflict", "upstream_incompatible"].includes(error.code)
-      ) {
+    const token = this.loadAuthToken(generation); this.refreshing = { generation, token };
+    try { return await token; }
+    catch (error) {
+      if (generation === this.store.generation && error instanceof ConnectorError && ["connect_auth_expired", "connect_account_conflict", "upstream_incompatible"].includes(error.code)) {
         this.last = publicAuth("failed", undefined, { code: error.code, message: error.message });
       }
       throw error;
-    } finally {
-      if (this.refreshing?.token === token) this.refreshing = undefined;
-    }
+    } finally { if (this.refreshing?.token === token) this.refreshing = undefined; }
   }
 
   private async loadAuthToken(generation: number): Promise<ConnectAuth> {
-    const existing = await this.store.read();
-    this.requireGeneration(generation);
-    if (!existing) throw new ConnectorError("connect_auth_expired", "Authenticate with T3 Connect before using Connect environments.");
-    if (Date.parse(existing.expiresAt) > Date.now() + AUTH_REFRESH_WINDOW_MS) return existing;
-    if (!existing.refreshToken) {
-      if (Date.parse(existing.expiresAt) > Date.now()) return existing;
-      throw new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
-    }
-
+    let auth = await this.store.read(); this.requireGeneration(generation);
     const settings = config();
-    const response = await fetchWithTimeout(settings.tokenEndpoint, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: existing.refreshToken,
-        client_id: settings.clientId,
-      }),
-    });
-    this.requireGeneration(generation);
-    if (!response.ok) {
-      if (response.status === 400 || response.status === 401) {
-        await this.invalidateAuth(existing, generation);
-        throw new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
-      }
-      throw connectErrorForStatus(response.status);
+    if (!auth?.nativeClientToken || !auth.sessionId || !auth.accountId || !associated(auth, settings)) throw new ConnectorError("connect_auth_expired", "Desktop native reauthentication is required; start the local browser login.");
+    this.remember(auth);
+    if (this.validatedSession === auth.sessionId && Date.parse(auth.expiresAt) > Date.now() + 5_000) return auth;
+    const active = () => this.requireGeneration(generation);
+    const clerk = new NativeClerk(settings, auth.nativeClientToken, async (nativeClientToken) => {
+      active(); this.secrets.add(nativeClientToken);
+      const rotated = { ...auth!, nativeClientToken };
+      if (!await this.store.replace(rotated, generation, auth!)) this.requireGeneration(-1);
+      auth = rotated;
+    }, active);
+    try {
+      await clerk.ownedSession(auth.sessionId, auth.accountId); active();
+      const token = await clerk.template(auth.sessionId, auth.accountId); active();
+      this.secrets.add(token.accessToken);
+      const refreshed = { ...auth, ...token, nativeClientToken: clerk.token };
+      await this.discover(settings, refreshed, active); active();
+      if (!await this.store.replace(refreshed, generation, auth)) this.requireGeneration(-1);
+      this.validatedSession = refreshed.sessionId;
+      this.last = { status: "authenticated" }; return refreshed;
+    } catch (error) {
+      if (error instanceof ConnectorError && error.code === "connect_auth_expired") await this.invalidateAuth(auth, generation);
+      throw error;
     }
-    const token = await this.readTokenResponse(response, existing.accountId);
-    this.requireGeneration(generation);
-    if (!existing.accountId || token.accountId !== existing.accountId) {
-      throw new ConnectorError("connect_account_conflict", "A different T3 Connect account was returned; sign out before switching accounts.");
-    }
-    this.rememberToken(token);
-    const refreshed: ConnectAuth = {
-      accessToken: token.accessToken,
-      refreshToken: token.refreshToken || existing.refreshToken,
-      expiresAt: token.expiresAt,
-      dpopPrivateJwk: existing.dpopPrivateJwk,
-      accountId: token.accountId,
-    };
-    if (!(await this.store.replace(refreshed, generation, existing))) {
-      throw safeAuthFailure("connect_auth_cancelled", "T3 Connect credentials changed during refresh; retry the operation.");
-    }
-    this.last = { status: "authenticated" };
-    return refreshed;
   }
 
   private async invalidateAuth(auth: ConnectAuth, generation: number): Promise<void> {
-    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), refreshToken: "" }, generation, auth);
+    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), nativeClientToken: "", accessToken: "" }, generation, auth);
     this.requireGeneration(generation);
-    if (saved) {
-      this.last = publicAuth("failed", undefined, {
-        code: "connect_auth_expired",
-        message: "T3 Connect authentication expired; authenticate again.",
-      });
-    }
+    if (saved) this.last = publicAuth("failed", undefined, { code: "connect_auth_expired", message: "T3 Connect authentication expired; authenticate again." });
   }
-
   private requireGeneration(generation: number): void {
-    if (generation !== this.store.generation) {
-      throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization is no longer active.");
-    }
+    this.store.assertOwner();
+    if (generation !== this.store.generation) throw new ConnectorError("connect_auth_cancelled", "T3 Connect authorization is no longer active.");
   }
-
   private requireLifecycle(lifecycle: number): void {
-    if (lifecycle !== this.lifecycle) {
-      throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization is no longer pending.");
-    }
+    if (lifecycle !== this.lifecycle) throw new ConnectorError("connect_auth_cancelled", "T3 Connect authorization is no longer pending.");
   }
-
   private stopPending(): void {
-    const pending = this.pending;
-    this.pending = undefined;
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    if (pending.server.listening) pending.server.close(() => undefined);
+    const pending = this.pending; this.pending = undefined;
+    if (pending) { clearTimeout(pending.timer); pending.ui.close(); }
+  }
+  private async finishPending(error: ConnectorError, expected: PendingAuthorization | undefined): Promise<void> {
+    if (!expected || this.pending !== expected) return;
+    const drained = this.store.invalidateWrites(); this.stopPending();
+    const generation = this.store.generation;
+    this.last = publicAuth("failed", undefined, { code: error.code, message: error.message });
+    await drained; await this.store.discardPending(generation);
+  }
+  private remember(auth: ConnectAuth): void {
+    for (const secret of [auth.accessToken, auth.nativeClientToken, auth.dpopPrivateJwk.d]) if (secret) this.secrets.add(secret);
   }
 
-  private rememberToken(token: { readonly accessToken: string; readonly refreshToken: string; readonly idToken?: string }): void {
-    for (const secret of [token.accessToken, token.refreshToken, token.idToken]) {
-      if (secret) this.secrets.add(secret);
+  async connectEnvironment(environmentId: string): Promise<{ readonly environment: ConnectEnvironment; readonly pairing: PairingResult;
+    readonly accountId?: string; readonly credential: string; readonly assertActive: () => void }> {
+    const selectedId = environmentId.trim();
+    if (!selectedId) throw new ConnectorError("invalid_input", "environmentId is required.");
+    const settings = config(), generation = this.store.generation, lifecycle = this.lifecycle;
+    const assertActive = () => { this.requireGeneration(generation); this.requireLifecycle(lifecycle); };
+    const auth = await this.authToken(); assertActive();
+    const environments = await this.listEnvironments(); assertActive();
+    const environment = environments.find((entry) => entry.id === selectedId);
+    if (!environment) throw new ConnectorError("connect_environment_not_found", "The selected Connect environment is unavailable.");
+    const relayToken = await this.relayAccessToken(settings, auth, assertActive); assertActive();
+    const key = auth.dpopPrivateJwk;
+    const connectUrl = `${settings.relayUrl}v1/environments/${encodeURIComponent(selectedId)}/connect`;
+    const response = await fetchWithTimeout(connectUrl, { method: "POST", headers: {
+      authorization: `DPoP ${relayToken}`, dpop: createDpopProof({ key, method: "POST", url: connectUrl, accessToken: relayToken }),
+      "content-type": "application/json" }, body: JSON.stringify({ clientProofKeyThumbprint: dpopThumbprint(key) }) });
+    assertActive();
+    if (response.status === 401) throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay proof or session; verify the upstream DPoP contract or use direct pairing.");
+    if (!response.ok) throw connectErrorForStatus(response.status);
+    const value = await responseJson(response); assertActive();
+    if (!value || typeof value !== "object") throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment credential.");
+    const result = value as Record<string, unknown>;
+    if (result.environmentId !== selectedId) throw new ConnectorError("connect_identity_mismatch", "T3 Connect did not prove the selected environment identity; select it again or use direct pairing.");
+    if (typeof result.credential !== "string" || !result.credential.trim() || /\s/.test(result.credential) ||
+      typeof result.expiresAt !== "string" || !Number.isFinite(Date.parse(result.expiresAt)) || Date.parse(result.expiresAt) <= Date.now()) {
+      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid or expired bootstrap credential; select the environment again or use direct pairing.");
     }
+    this.secrets.add(relayToken); this.secrets.add(result.credential);
+    const connectedEnvironment = parseConnectEnvironment({ environmentId: result.environmentId, endpoint: result.endpoint,
+      label: environment.label, linkedAt: environment.linkedAt }, [...this.secrets]);
+    if ((result.endpoint as Record<string, unknown>).providerKind !== "cloudflare_tunnel") throw new ConnectorError("upstream_incompatible", "T3 Connect registration requires a ready managed cloudflare_tunnel endpoint; use direct pairing for other providers.");
+    const pairing = await pairConnectEnvironment(parseEndpoint(connectedEnvironment.endpoint, result.credential), key, selectedId, assertActive);
+    assertActive();
+    return { environment: connectedEnvironment, pairing, credential: result.credential, assertActive, accountId: auth.accountId! };
   }
 
   private async relayAccessToken(settings: ConnectConfig, auth: ConnectAuth, assertActive: () => void): Promise<string> {
     assertActive();
-    // This is a compatibility preflight, not signature verification. The relay verifies
-    // the issuer signature. Hosted OAuth does not provide a verified template-JWT handoff.
-    let compatible = false;
-    try {
-      const parts = auth.accessToken.split(".");
-      const header = JSON.parse(Buffer.from(parts[0] ?? "", "base64url").toString("utf8")) as Record<string, unknown>;
-      const claims = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString("utf8")) as Record<string, unknown>;
-      const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-      compatible = parts.length === 3 && !!parts[2] && typeof header.alg === "string" && header.alg !== "none" &&
-        claims.sub === auth.accountId && audiences.includes("t3-code-relay") &&
-        typeof claims.exp === "number" && Number.isFinite(claims.exp) && claims.exp > Date.now() / 1_000;
-    } catch {
-      // Opaque and malformed OAuth tokens remain usable for discovery, not this exchange.
-    }
-    if (!compatible) {
-      throw new ConnectorError("upstream_incompatible",
-        "Connect registration requires a relay-audience JWT. Hosted OAuth has no verified JWT handoff; use direct pairing or wait for a verified upstream client authorization contract.");
-    }
     const url = `${settings.relayUrl}v1/client/dpop-token`;
-    const proof = createDpopProof({ key: auth.dpopPrivateJwk, method: "POST", url });
-    const response = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: { dpop: proof, "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: TOKEN_EXCHANGE_GRANT_TYPE,
-        subject_token: auth.accessToken,
-        subject_token_type: RELAY_JWT_SUBJECT_TOKEN_TYPE,
-        requested_token_type: RELAY_ACCESS_TOKEN_TYPE,
-        resource: new URL(settings.relayUrl).origin,
-        scope: "environment:connect",
-        client_id: settings.relayClientId,
-      }),
-    });
+    const response = await fetchWithTimeout(url, { method: "POST", headers: {
+      dpop: createDpopProof({ key: auth.dpopPrivateJwk, method: "POST", url }), "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: TOKEN_EXCHANGE_GRANT_TYPE, subject_token: auth.accessToken,
+        subject_token_type: "urn:ietf:params:oauth:token-type:jwt", requested_token_type: RELAY_ACCESS_TOKEN_TYPE,
+        resource: new URL(settings.relayUrl).origin, scope: "environment:connect", client_id: settings.relayClientId }) });
     assertActive();
-    if (response.status === 400 || response.status === 401) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay JWT or DPoP exchange; verify the upstream client authorization contract or use direct pairing.");
-    }
+    if (response.status === 400 || response.status === 401) throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay JWT or DPoP exchange; verify the upstream client authorization contract or use direct pairing.");
     if (!response.ok) throw connectErrorForStatus(response.status);
-    const value = await responseJson(response);
-    assertActive();
+    const value = await responseJson(response); assertActive();
     const relay = value as Record<string, unknown>;
-    if (
-      !value ||
-      typeof value !== "object" ||
-      typeof relay.access_token !== "string" ||
-      !relay.access_token.trim() || /\s/.test(relay.access_token) ||
-      relay.issued_token_type !== RELAY_ACCESS_TOKEN_TYPE ||
-      relay.token_type !== "DPoP" ||
-      typeof relay.expires_in !== "number" ||
-      !Number.isInteger(relay.expires_in) || relay.expires_in <= 0 || relay.expires_in > 1800 ||
-      typeof relay.scope !== "string" ||
-      relay.scope !== "environment:connect"
-    ) {
+    if (!value || typeof value !== "object" || typeof relay.access_token !== "string" || !relay.access_token.trim() || /\s/.test(relay.access_token) ||
+      relay.issued_token_type !== RELAY_ACCESS_TOKEN_TYPE || relay.token_type !== "DPoP" || typeof relay.expires_in !== "number" ||
+      !Number.isInteger(relay.expires_in) || relay.expires_in <= 0 || relay.expires_in > 1800 || relay.scope !== "environment:connect") {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid relay session.");
     }
-    return relay.access_token as string;
-  }
-
-  private async readTokenResponse(response: Response, pinnedAccountId?: string): Promise<OAuthToken> {
-    const value = await responseJson(response);
-    if (
-      !value ||
-      typeof value !== "object" ||
-      typeof (value as Record<string, unknown>).access_token !== "string" ||
-      typeof (value as Record<string, unknown>).expires_in !== "number"
-    ) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid authentication response.");
-    }
-    const token = value as Record<string, unknown>;
-    const accessToken = token.access_token as string;
-    const expiresIn = token.expires_in;
-    if (
-      !accessToken.trim() || /\s/.test(accessToken) ||
-      typeof token.token_type !== "string" || token.token_type.toLowerCase() !== "bearer" ||
-      (token.refresh_token !== undefined && typeof token.refresh_token !== "string") ||
-      (token.id_token !== undefined && (typeof token.id_token !== "string" || !decodeJwtSubject(token.id_token))) ||
-      typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0 ||
-      !Number.isFinite(new Date(Date.now() + expiresIn * 1_000).getTime())
-    ) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid authentication response.");
-    }
-    const accessSubject = decodeJwtSubject(accessToken);
-    const idSubject = decodeJwtSubject(typeof token.id_token === "string" ? token.id_token : undefined);
-    const accountId = idSubject ?? accessSubject ?? pinnedAccountId;
-    if (!accountId || (accessSubject && idSubject && accessSubject !== idSubject)) {
-      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid account identity.");
-    }
-    return {
-      accessToken,
-      refreshToken: typeof token.refresh_token === "string" ? token.refresh_token : "",
-      expiresAt: new Date(Date.now() + expiresIn * 1_000).toISOString(),
-      accountId,
-      ...(typeof token.id_token === "string" ? { idToken: token.id_token } : {}),
-    };
-  }
-
-  private async handleCallback(
-    request: IncomingMessage,
-    response: ServerResponse,
-  ): Promise<void> {
-    const pending = this.pending;
-    if (!pending) {
-      response.writeHead(410, { "content-type": "text/plain" });
-      response.end("T3 Connect authorization is no longer pending.");
-      return;
-    }
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (url.pathname !== "/callback") {
-      response.writeHead(404);
-      response.end();
-      return;
-    }
-    if (request.method !== "GET") {
-      response.writeHead(405, { allow: "GET" });
-      response.end();
-      return;
-    }
-    if (url.searchParams.getAll("state").length !== 1 || url.searchParams.get("state") !== pending.state) {
-      response.writeHead(400, { "content-type": "text/plain" });
-      response.end("Invalid T3 Connect authorization callback.");
-      return;
-    }
-    if (pending.exchanging) {
-      response.writeHead(409, { "content-type": "text/plain" });
-      response.end("T3 Connect authorization is already being completed.");
-      return;
-    }
-    const error = url.searchParams.get("error");
-    if (error) {
-      const expired = error === "expired_token" || error === "login_required";
-      await this.finishPending("failed", expired ? "connect_auth_expired" : "connect_auth_failed",
-        expired ? "T3 Connect authorization expired; authenticate again." : "T3 Connect authorization was denied.", pending);
-      response.writeHead(200, { "content-type": "text/plain" });
-      response.end("T3 Connect authorization was not completed. You may close this window.");
-      return;
-    }
-    const code = url.searchParams.get("code");
-    if (!code?.trim() || url.searchParams.getAll("code").length !== 1) {
-      await this.finishPending("failed", "connect_auth_failed", "T3 Connect returned an invalid authorization callback.", pending);
-      response.writeHead(400, { "content-type": "text/plain" });
-      response.end("Invalid T3 Connect authorization callback.");
-      return;
-    }
-    pending.exchanging = true;
-    try {
-      const settings = config();
-      const tokenResponse = await fetchWithTimeout(settings.tokenEndpoint, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: `http://127.0.0.1:${(pending.server.address() as import("node:net").AddressInfo).port}/callback`,
-          client_id: settings.clientId,
-          code_verifier: pending.verifier,
-        }),
-      });
-      if (!tokenResponse.ok) throw safeAuthFailure("connect_auth_failed", "T3 Connect authorization failed.");
-      const token = await this.readTokenResponse(tokenResponse);
-      await this.finishPendingWithToken(token, pending);
-      response.writeHead(200, { "content-type": "text/plain" });
-      response.end("T3 Connect authorization completed. You may close this window.");
-    } catch (callbackError) {
-      const failureCode =
-        callbackError instanceof ConnectorError && callbackError.code === "connect_auth_expired"
-          ? "connect_auth_expired"
-          : "connect_auth_failed";
-      await this.finishPending("failed", failureCode, "T3 Connect authorization failed.", pending);
-      response.writeHead(200, { "content-type": "text/plain" });
-      response.end("T3 Connect authorization failed. You may close this window.");
-    }
-  }
-
-  private async finishPendingWithToken(
-    token: OAuthToken,
-    pending: PendingAuthorization,
-  ): Promise<void> {
-    if (this.pending !== pending) {
-      throw safeAuthFailure("connect_auth_expired", "T3 Connect authorization is no longer pending.");
-    }
-    const existing = await this.store.read();
-    if (this.pending !== pending) throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization was cancelled.");
-    if (existing && (!existing.accountId || token.accountId !== existing.accountId)) {
-      this.stopPending();
-      this.last = publicAuth("failed", undefined, {
-        code: "connect_account_conflict",
-        message: "A different T3 Connect account is already active; sign out before switching accounts.",
-      });
-      throw new ConnectorError("connect_account_conflict", "Sign out of T3 Connect before switching accounts.");
-    }
-    this.rememberToken(token);
-    const saved = await this.store.replace({
-      accessToken: token.accessToken,
-      refreshToken: token.refreshToken,
-      expiresAt: token.expiresAt,
-      dpopPrivateJwk: pending.key,
-      accountId: token.accountId,
-    }, pending.generation);
-    if (!saved || this.pending !== pending) throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization was cancelled.");
-    this.stopPending();
-    this.last = { status: "authenticated" };
-  }
-
-  private async finishPending(
-    status: "failed" | "cancelled",
-    code: "connect_auth_failed" | "connect_auth_expired" | "connect_auth_cancelled",
-    message: string,
-    expected = this.pending,
-  ): Promise<void> {
-    const pending = this.pending;
-    if (!pending || pending !== expected) return;
-    const drained = this.store.invalidateWrites();
-    this.stopPending();
-    this.last = publicAuth(status, undefined, { code, message });
-    await drained;
+    this.secrets.add(relay.access_token); return relay.access_token;
   }
 }
