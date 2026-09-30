@@ -85,7 +85,7 @@ function normalizedUrl(value: string, allowLoopbackHttp: boolean): string {
   if (url.protocol !== "https:" && !(allowLoopbackHttp && loopback && url.protocol === "http:")) {
     throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
   }
-  if (url.username || url.password || url.search || url.hash) {
+  if (url.username || url.password || url.search || url.hash || url.pathname !== "/") {
     throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid.");
   }
   url.pathname = "/";
@@ -464,32 +464,40 @@ export class ConnectManager {
       },
       body: JSON.stringify({ clientProofKeyThumbprint: dpopThumbprint(key) }),
     });
+    if (connectResponse.status === 401) {
+      throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay proof or session; verify the upstream DPoP contract or use direct pairing.");
+    }
     if (!connectResponse.ok) throw connectErrorForStatus(connectResponse.status);
     const value = await responseJson(connectResponse);
     if (!value || typeof value !== "object") {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment credential.");
     }
     const result = value as Record<string, unknown>;
+    if (result.environmentId !== selectedId) {
+      throw new ConnectorError("connect_identity_mismatch", "T3 Connect did not prove the selected environment identity; select it again or use direct pairing.");
+    }
     if (
-      result.environmentId !== selectedId ||
       typeof result.credential !== "string" ||
       !result.credential.trim() ||
-      typeof result.endpoint !== "object" ||
-      result.endpoint === null ||
-      typeof (result.endpoint as Record<string, unknown>).httpBaseUrl !== "string"
+      /\s/.test(result.credential) ||
+      typeof result.expiresAt !== "string" ||
+      !Number.isFinite(Date.parse(result.expiresAt)) || Date.parse(result.expiresAt) <= Date.now()
     ) {
-      throw new ConnectorError("connect_identity_mismatch", "T3 Connect did not prove the selected environment identity.");
+      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid or expired bootstrap credential; select the environment again or use direct pairing.");
+    }
+    const connectedEnvironment = parseConnectEnvironment({ environmentId: result.environmentId, endpoint: result.endpoint,
+      label: environment.label, linkedAt: environment.linkedAt },
+      [...this.secrets, auth.accessToken, auth.refreshToken, relayToken, result.credential, key.d]);
+    if ((result.endpoint as Record<string, unknown>).providerKind !== "cloudflare_tunnel") {
+      throw new ConnectorError("upstream_incompatible", "T3 Connect registration requires a ready managed cloudflare_tunnel endpoint; use direct pairing for other providers.");
     }
     const endpoint = parseEndpoint(
-      (result.endpoint as Record<string, unknown>).httpBaseUrl as string,
+      connectedEnvironment.endpoint,
       result.credential,
     );
-    const pairing = await pairConnectEnvironment(endpoint, key);
-    if (pairing.descriptor.environmentId !== selectedId) {
-      throw new ConnectorError("connect_identity_mismatch", "The environment returned a different identity than Connect selected.");
-    }
+    const pairing = await pairConnectEnvironment(endpoint, key, selectedId);
     return {
-      environment,
+      environment: connectedEnvironment,
       pairing,
       credential: result.credential,
       ...(auth.accountId ? { accountId: auth.accountId } : {}),
@@ -601,6 +609,24 @@ export class ConnectManager {
   }
 
   private async relayAccessToken(settings: ConnectConfig, auth: ConnectAuth): Promise<string> {
+    // This is a compatibility preflight, not signature verification. The relay verifies
+    // the issuer signature. Hosted OAuth does not provide a verified template-JWT handoff.
+    let compatible = false;
+    try {
+      const parts = auth.accessToken.split(".");
+      const header = JSON.parse(Buffer.from(parts[0] ?? "", "base64url").toString("utf8")) as Record<string, unknown>;
+      const claims = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString("utf8")) as Record<string, unknown>;
+      const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+      compatible = parts.length === 3 && !!parts[2] && typeof header.alg === "string" && header.alg !== "none" &&
+        claims.sub === auth.accountId && audiences.includes("t3-code-relay") &&
+        typeof claims.exp === "number" && Number.isFinite(claims.exp) && claims.exp > Date.now() / 1_000;
+    } catch {
+      // Opaque and malformed OAuth tokens remain usable for discovery, not this exchange.
+    }
+    if (!compatible) {
+      throw new ConnectorError("upstream_incompatible",
+        "Connect registration requires a relay-audience JWT. Hosted OAuth has no verified JWT handoff; use direct pairing or wait for a verified upstream client authorization contract.");
+    }
     const url = `${settings.relayUrl}v1/client/dpop-token`;
     const proof = createDpopProof({ key: auth.dpopPrivateJwk, method: "POST", url });
     const response = await fetchWithTimeout(url, {
@@ -611,11 +637,14 @@ export class ConnectManager {
         subject_token: auth.accessToken,
         subject_token_type: RELAY_JWT_SUBJECT_TOKEN_TYPE,
         requested_token_type: RELAY_ACCESS_TOKEN_TYPE,
-        resource: settings.relayUrl,
+        resource: new URL(settings.relayUrl).origin,
         scope: "environment:connect",
         client_id: settings.relayClientId,
       }),
     });
+    if (response.status === 400 || response.status === 401) {
+      throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay JWT or DPoP exchange; verify the upstream client authorization contract or use direct pairing.");
+    }
     if (!response.ok) throw connectErrorForStatus(response.status);
     const value = await responseJson(response);
     const relay = value as Record<string, unknown>;
@@ -623,10 +652,13 @@ export class ConnectManager {
       !value ||
       typeof value !== "object" ||
       typeof relay.access_token !== "string" ||
+      !relay.access_token.trim() || /\s/.test(relay.access_token) ||
+      relay.issued_token_type !== RELAY_ACCESS_TOKEN_TYPE ||
       relay.token_type !== "DPoP" ||
       typeof relay.expires_in !== "number" ||
+      !Number.isInteger(relay.expires_in) || relay.expires_in <= 0 || relay.expires_in > 1800 ||
       typeof relay.scope !== "string" ||
-      !relay.scope.split(/\s+/).includes("environment:connect")
+      relay.scope !== "environment:connect"
     ) {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid relay session.");
     }

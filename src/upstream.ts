@@ -178,6 +178,9 @@ async function request(
     if (errorCode === "thread" && response.status === 404) {
       throw new ConnectorError("thread_not_found", "The requested thread was not found.");
     }
+    if ((errorCode === "projects" || errorCode === "thread") && response.status >= 500) {
+      throw new ConnectorError("transport_error", "The environment is temporarily unavailable; check its reachability.");
+    }
     throw new ConnectorError(
       errorCode === "descriptor" || errorCode === "projects" || errorCode === "thread"
         ? "upstream_incompatible"
@@ -232,6 +235,7 @@ function parseSession(
   if (
     !Array.isArray(scopes) ||
     !REQUIRED_SCOPES.every((scope) => scopes.includes(scope)) ||
+    (tokenType === "DPoP" && scopes.some((scope) => !REQUIRED_SCOPES.some((required) => required === scope))) ||
     value.sessionMethod !==
       (tokenType === "DPoP" ? "dpop-access-token" : "bearer-access-token")
   ) {
@@ -244,14 +248,17 @@ function parseSession(
   if (!requiredString(value.expiresAt) || Number.isNaN(Date.parse(value.expiresAt))) {
     throw new ConnectorError("upstream_incompatible", "The environment session expiry is invalid.");
   }
-  return new Date(
-    Math.min(Date.parse(value.expiresAt), Date.parse(accessTokenExpiresAt)),
-  ).toISOString();
+  const expiry = Math.min(Date.parse(value.expiresAt), Date.parse(accessTokenExpiresAt));
+  if (expiry <= Date.now()) {
+    throw new ConnectorError("session_expired", "The environment session is already expired; obtain a fresh pairing grant.");
+  }
+  return new Date(expiry).toISOString();
 }
 
 async function pairWithGrant(
   endpoint: ValidatedEndpoint,
   proofKey?: DpopPrivateJwk,
+  expectedEnvironmentId?: string,
 ): Promise<PairingResult> {
   const descriptorResponse = await request(
     endpointPath(endpoint.baseUrl, "/.well-known/t3/environment"),
@@ -261,6 +268,14 @@ async function pairWithGrant(
   const descriptor = parseDescriptor(
     await json(descriptorResponse, "upstream_incompatible"),
   );
+  const descriptorMetadata = JSON.stringify(descriptor);
+  if ([endpoint.grant, proofKey?.d].filter((secret): secret is string => !!secret)
+    .some((secret) => descriptorMetadata.includes(secret) || descriptorMetadata.includes(encodeURIComponent(secret)))) {
+    throw new ConnectorError("upstream_incompatible", "The environment returned unsafe descriptor metadata; use a verified environment endpoint.");
+  }
+  if (expectedEnvironmentId !== undefined && descriptor.environmentId !== expectedEnvironmentId) {
+    throw new ConnectorError("connect_identity_mismatch", "The environment returned a different identity than Connect selected; select a verified endpoint or use direct pairing.");
+  }
 
   const tokenType = proofKey ? "DPoP" : "Bearer";
   const body = new URLSearchParams({
@@ -297,17 +312,25 @@ async function pairWithGrant(
   if (
     !isRecord(token) ||
     !requiredString(token.access_token) ||
+    /\s/.test(token.access_token) ||
     token.token_type !== tokenType ||
     token.issued_token_type !== ACCESS_TOKEN_TYPE ||
     typeof token.expires_in !== "number" ||
     !Number.isFinite(token.expires_in) ||
     token.expires_in <= 0 ||
-    !requiredString(token.scope)
+    !Number.isFinite(new Date(Date.now() + token.expires_in * 1000).getTime()) ||
+    (proofKey !== undefined && (!Number.isInteger(token.expires_in) || token.expires_in > 3600)) ||
+    !requiredString(token.scope) ||
+    (proofKey !== undefined && !/^[\x21\x23-\x5b\x5d-\x7e]+(?: [\x21\x23-\x5b\x5d-\x7e]+)*$/.test(token.scope))
   ) {
     throw new ConnectorError("upstream_incompatible", "The environment token response is invalid.");
   }
+  if (descriptorMetadata.includes(token.access_token) || descriptorMetadata.includes(encodeURIComponent(token.access_token))) {
+    throw new ConnectorError("upstream_incompatible", "The environment returned unsafe descriptor metadata; use a verified environment endpoint.");
+  }
   const grantedScopes = token.scope.trim().split(/\s+/);
-  if (!REQUIRED_SCOPES.every((scope) => grantedScopes.includes(scope))) {
+  if (!REQUIRED_SCOPES.every((scope) => grantedScopes.includes(scope)) ||
+    (proofKey !== undefined && grantedScopes.some((scope) => !REQUIRED_SCOPES.some((required) => required === scope)))) {
     throw new ConnectorError(
       "permission_denied",
       "The environment did not grant the required orchestration scopes.",
@@ -361,8 +384,9 @@ export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<Pair
 export async function pairConnectEnvironment(
   endpoint: ValidatedEndpoint,
   proofKey: DpopPrivateJwk,
+  expectedEnvironmentId: string,
 ): Promise<PairingResult> {
-  return pairWithGrant(endpoint, proofKey);
+  return pairWithGrant(endpoint, proofKey, expectedEnvironmentId);
 }
 
 function invalidOrchestration(message: string): never {

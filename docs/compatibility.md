@@ -25,7 +25,7 @@ explicit grant remain query-free, and accepted grants are stripped before any re
 The upstream pairing grant is exchanged for a short-lived environment session. It is not stored after
 the exchange. The bearer session is stored privately for later workflow slices.
 
-## T3 Connect Contract
+## Experimental T3 Connect contract
 
 Connect is optional and does not replace direct pairing. `connect_authenticate` starts a local callback
 flow using the configured Clerk OAuth token endpoint and a PKCE verifier; the browser authorization URL
@@ -33,16 +33,24 @@ and status are public, while tokens and the DPoP private key remain in the separ
 state file.
 
 After authentication, `list_connect_environments` uses the Connect relay for discovery only. The
-connector never saves a discovered environment implicitly. `register_connect_environment` or
+connector never saves a discovered environment implicitly. The hosted OAuth flow has no verified
+handoff for the relay-audience JWT required for registration at either the pinned target or current
+`main` commit `c2fa9fc911daeac97df4760f95fc57dca42b84c8`. An incompatible subject produces sanitized
+`upstream_incompatible` recovery guidance. See [registration contract and blocker](connect-registration-contract.md).
+
+Against a contract-compatible controlled issuer, `register_connect_environment` or
 `attach_connect_environment` explicitly selects an environment, requests a relay DPoP-bound credential,
 and exchanges that credential at the environment's `/oauth/token` endpoint with a DPoP proof key.
 Connect environment requests use the resulting DPoP access token and proof; direct environment requests
 continue to use bearer access tokens.
 
 The selected environment identifier is checked against both the relay response and the environment
-descriptor before state is written. `sign_out_connect` clears only Connect authentication, while saved
+descriptor before the bootstrap is redeemed. The endpoint actually paired is persisted.
+`sign_out_connect` clears only Connect authentication, while saved
 environment sessions remain available when valid. `unregister_environment` removes the saved
-environment and all of its stored access paths.
+environment and all of its stored access paths. Safe reads and mutation preflight may select an
+alternate retained path after transport failure or revocation. Dispatch never switches paths or
+replays after submission.
 
 ## Orchestration Read Contract
 
@@ -95,13 +103,14 @@ queue a call.
 
 ## Support statement
 
-The supported upstream contract is T3 Code's direct environment and orchestration protocol version
-`1`, plus the optional Connect relay contract evidenced by upstream commit
-`7445aa733ada33e45289e5aa5055f79142556513`. The automated fixtures advertise server version `0.0.42`
-and implement those contracts; the public MCP tests exercise pairing, Connect authentication and
+The implemented direct environment and orchestration contract is protocol version `1` at upstream
+commit `7445aa733ada33e45289e5aa5055f79142556513`. Connect is optional/experimental and blocked on
+the hosted OAuth-to-relay authorization contract. The automated fixtures advertise server version `0.0.42`;
+the public MCP tests exercise pairing, Connect authentication and
 discovery, explicit registration and attachment, sign-out, unregistration, dispatch, observation,
 pagination, authorization failures, and ambiguous mutation outcomes. This is tested protocol
-compatibility, not a claim that the fixture's server version is a currently deployed T3 release.
+behavior, not a claim that the fixture's server version is a currently deployed T3 release or that
+hosted Connect registration works.
 
 ## Verification
 
@@ -112,6 +121,11 @@ explicit registration and attachment, DPoP environment requests, sign-out, unreg
 registration isolation, project discovery, thread status mapping, bounded pagination, first-turn and
 continuation acknowledgement/failure handling, same-thread retrieval, malformed and insecure URLs,
 redaction, owner-only storage on all supported platforms, and redirect rejection.
+
+The Connect fixture checks exact normalized relay resource, subject JWT signature/audience, ready
+managed-provider eligibility, DPoP signature/claims/token/key binding/replay, and one-use bootstrap
+redemption. The packed package also runs project/start/read/continue/read against this controlled
+contract. Fixture JWT issuance does not establish a hosted OAuth handoff or complete #14/#16.
 
 A live direct-pairing or Connect smoke check against a real T3 environment was not run for this release
 because this workspace has no operator-authorized environment endpoint, grant, or Connect account. No

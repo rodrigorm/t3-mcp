@@ -195,7 +195,10 @@ export class EnvironmentConnector {
     this.connect = new ConnectManager(connectStore);
   }
 
-  private async selectEnvironment(environmentId: string): Promise<PairedEnvironment> {
+  private async readWithAccess<T>(
+    environmentId: string,
+    read: (environment: PairedEnvironment) => Promise<T>,
+  ): Promise<{ readonly environment: PairedEnvironment; readonly value: T }> {
     if (typeof environmentId !== "string" || !environmentId.trim()) {
       throw new ConnectorError("invalid_input", "environmentId is required.");
     }
@@ -210,14 +213,21 @@ export class EnvironmentConnector {
     } else if (environment.accessSource === "direct" && environment.connectAccess) {
       candidates.push({ ...environment, ...environment.connectAccess, accessSource: "connect" });
     }
-    for (const candidate of candidates) {
-      const expiresAt = Date.parse(candidate.sessionExpiresAt);
-      if (!Number.isFinite(expiresAt) || expiresAt > Date.now()) return candidate;
-    }
-    throw new ConnectorError(
+    let failure = new ConnectorError(
       "session_expired",
       "The saved environment session expired or was revoked; pair the environment again.",
     );
+    for (const candidate of candidates) {
+      const expiresAt = Date.parse(candidate.sessionExpiresAt);
+      if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) continue;
+      try {
+        return { environment: candidate, value: await read(candidate) };
+      } catch (error) {
+        if (!(error instanceof ConnectorError) || !["transport_error", "session_expired"].includes(error.code)) throw error;
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   async addEnvironment(input: AddEnvironmentInput): Promise<PublicEnvironment> {
@@ -382,7 +392,7 @@ export class EnvironmentConnector {
   }
 
   async listProjects(environmentId: string): Promise<readonly PublicProject[]> {
-    return listUpstreamProjects(await this.selectEnvironment(environmentId));
+    return (await this.readWithAccess(environmentId, listUpstreamProjects)).value;
   }
 
   async startTurn(input: StartTurnInput): Promise<PublicStartTurn> {
@@ -399,8 +409,9 @@ export class EnvironmentConnector {
       );
     }
     const explicitModelSelection = cleanModelSelection(input.modelSelection);
-    const environment = await this.selectEnvironment(environmentId);
-    const project = await getProjectForStart(environment, projectId);
+    const { environment, value: project } = await this.readWithAccess(
+      environmentId, (candidate) => getProjectForStart(candidate, projectId),
+    );
     const modelSelection = explicitModelSelection ?? project.defaultModelSelection;
     if (!modelSelection) {
       throw new ConnectorError(
@@ -485,8 +496,9 @@ export class EnvironmentConnector {
       );
     }
 
-    const environment = await this.selectEnvironment(environmentId);
-    const thread = await getUpstreamThread(environment, threadId);
+    const { environment, value: thread } = await this.readWithAccess(
+      environmentId, (candidate) => getUpstreamThread(candidate, threadId),
+    );
     if (thread.status === "starting" || thread.status === "running") {
       throw new ConnectorError(
         "thread_busy",
@@ -540,7 +552,6 @@ export class EnvironmentConnector {
   }
 
   async getThread(input: GetThreadInput): Promise<PublicThread> {
-    const environment = await this.selectEnvironment(input.environmentId);
     const threadId = input.threadId.trim();
     if (!threadId) {
       throw new ConnectorError("invalid_input", "threadId is required.");
@@ -560,6 +571,7 @@ export class EnvironmentConnector {
     if (input.beforeCursor !== undefined && !beforeCursor) {
       throw new ConnectorError("invalid_input", "beforeCursor must not be empty.");
     }
-    return getUpstreamThread(environment, threadId, turnLimit, beforeCursor);
+    return (await this.readWithAccess(input.environmentId,
+      (candidate) => getUpstreamThread(candidate, threadId, turnLimit, beforeCursor))).value;
   }
 }

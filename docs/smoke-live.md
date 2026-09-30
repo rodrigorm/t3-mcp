@@ -41,15 +41,12 @@ T3_MCP_PAIRING_FILE="$PAIRING_FILE" \
 node scripts/smoke-live.mjs
 ```
 
-The runner uses the linked `t3-mcp` command, searches the paired environments for project
-`f4d5edfb-adbb-48c4-8e45-7afdb69f1aca`, and prints only redacted step summaries. The capture form
-also handles the Desktop CLI's local-LAN pairing URL by extracting its grant privately and sending
-it to the required loopback endpoint. To use an explicit environment, add
-`T3_MCP_ENVIRONMENT_ID=<environment-id>` without printing or committing a token.
-
-This host's projects currently have no model default, so the runner explicitly uses
-`instanceId=opencode` and `model=openai/gpt-5.6-luna`, matching the local `t3-turn` defaults. Override
-them with `T3_MCP_MODEL_INSTANCE` and `T3_MCP_MODEL` when using another host.
+The runner uses the linked `t3-mcp` command and prints redacted step summaries.
+Select an operator-authorized disposable project with `T3_MCP_PROJECT_ID` and environment with
+`T3_MCP_ENVIRONMENT_ID`. Set `T3_MCP_MODEL_INSTANCE` and `T3_MCP_MODEL` to the selected
+environment's available provider/model. Set `T3_MCP_LOOPBACK_ENDPOINT` when using a different
+local port. Supply these explicitly rather than relying on the script's developer defaults.
+The pairing-file form extracts its grant privately and uses the configured loopback endpoint.
 
 The first run saves the environment session in `/tmp/t3-mcp-smoke-state`. To re-pair that saved
 environment with a fresh grant, set `T3_MCP_REPAIR_ENVIRONMENT_ID=<environment-id>`.
@@ -83,51 +80,39 @@ Each step reports `outcome=accepted`, `outcome=approval_required`, or `outcome=u
 reports `approval_required` or `input_required`, resolve it in T3 Code and observe it again before
 deciding whether any later action is safe.
 
-## Connect Smoke
+## Connect smoke, blocked pending upstream authorization
 
-The Connect path needs an operator-authorized Connect account and a selected environment. Configure the
-relay, OAuth token endpoint, and client id in the MCP process environment using
-`T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_TOKEN_ENDPOINT`, and `T3_MCP_CONNECT_CLIENT_ID` (or the
-documented aliases). Do not put these values in the repository.
+Connect is optional and experimental. The pinned and inspected current upstream relay require
+a `t3-code-relay` audience JWT. Hosted OAuth has no verified private JWT handoff to this package.
+Resolve [the registration blocker](connect-registration-contract.md) before claiming this smoke.
+Controlled HTTP fixture success is not evidence that the hosted login can authorize registration.
 
-Through an MCP client, run this sequence:
+After a verified upstream client authorization contract exists, #16 requires an explicitly authorized
+account, selected ready managed `cloudflare_tunnel` environment, and disposable project/model.
+Configure the relay, OAuth token endpoint, and matching hosted-page client through the MCP process
+environment. Keep callback exchanges and credentials private.
 
-1. Call `connect_authenticate` with `action=start` and open the returned `authorizationUrl`.
-2. Complete the browser flow, then poll `connect_authenticate` with `action=status` until it reports
-   `authenticated`.
-3. Call `list_connect_environments` and record the selected environment id without saving any other
-   environment.
-4. Call `register_connect_environment` for a new registration, or
-   `attach_connect_environment` for a previously direct-paired registration.
-5. Call `list_environments`, `list_projects`, and one non-destructive observation such as
-   `get_thread`; confirm no token or DPoP key appears in results or logs.
-6. Call `sign_out_connect`, confirm Connect discovery is rejected while the saved environment session
-   remains usable, then call `unregister_environment` and confirm the registration is gone after a
-   process restart.
+Run the installed package through an MCP client:
 
-This manual Connect sequence was not run for this release because no operator-authorized account or
-remote environment was provided.
+1. Start `connect_authenticate`, complete the browser flow, and poll sanitized status to success.
+2. Discover and explicitly select one environment. Confirm discovery has not changed saved registrations.
+3. Register a new identity or explicitly attach a matching existing registration. Confirm unrelated
+   registrations survive and the selected environment retains one stable `environmentId`.
+4. List environments and projects, then start a bounded turn in the chosen project.
+5. Read the returned thread until settled. An acknowledgement is not completion.
+6. Continue that same settled thread, then read until the continuation is settled.
+7. Restart the connector and verify registration/session persistence.
+8. Sign out of connector Connect login. Discovery must fail while a valid reachable environment
+   session still permits project/thread reads. Connector sign-out does not unlink the environment's
+   own managed tunnel.
+9. Unregister the selected environment, restart, and verify its local access is gone while unrelated
+   registrations remain usable.
 
-## Connect Smoke
+Resolve approvals/user input in T3 Code. Never replay an ambiguous mutation; inspect its retained
+thread/command identifiers. Save only sanitized outcomes and public IDs/version/timestamps.
+Do not borrow host credentials or substitute administrative sessions for operator authorization.
 
-The Connect path needs an operator-authorized Connect account and a selected environment. Configure the
-relay, OAuth token endpoint, and client id in the MCP process environment using
-`T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_TOKEN_ENDPOINT`, and `T3_MCP_CONNECT_CLIENT_ID` (or the
-documented aliases). Do not put these values in the repository.
-
-Through an MCP client, run this sequence:
-
-1. Call `connect_authenticate` with `action=start` and open the returned `authorizationUrl`.
-2. Complete the browser flow, then poll `connect_authenticate` with `action=status` until it reports
-   `authenticated`.
-3. Call `list_connect_environments` and select one environment id without saving any other environment.
-4. Call `register_connect_environment` for a new registration, or
-   `attach_connect_environment` for a previously direct-paired registration.
-5. Call `list_environments`, `list_projects`, and one non-destructive observation such as
-   `get_thread`; confirm no token or DPoP key appears in results or logs.
-6. Call `sign_out_connect`, confirm Connect discovery is rejected while a valid saved environment
-   session remains usable, then call `unregister_environment` and confirm the registration is gone after
-   a process restart.
-
-This manual Connect sequence was not run for this release because no operator-authorized account or
-remote environment was provided.
+No live direct-pairing or Connect smoke was performed during #14. The automated public MCP and
+installed-package sequences use controlled local HTTP with fixture-issued JWTs and cryptographically
+validated DPoP. #14 remains blocked on authorization handoff; #16 remains blocked on that contract
+and an authorized real account/environment/project.

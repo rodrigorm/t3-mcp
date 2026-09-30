@@ -1,7 +1,7 @@
 # t3-mcp
 
 Host-independent MCP connector for directly pairing [T3 Code](https://t3.gg) environments, with
-optional operator-driven T3 Connect support. It does not require a host-specific bot setup or a local
+optional experimental T3 Connect tools. It does not require a host-specific bot setup or a local
 turn CLI.
 
 ## Install
@@ -44,7 +44,9 @@ host-neutral and uses MCP tools rather than shell commands.
 2. For the optional Connect path, call `connect_authenticate`, complete the browser flow, and call
    `list_connect_environments`. Discovery does not save environments; call
    `register_connect_environment` for a new saved environment or `attach_connect_environment` for
-   an existing direct registration.
+    an existing direct registration. Registration currently has an upstream authentication blocker;
+    hosted OAuth does not provide a verified relay-audience JWT handoff. Use direct pairing while
+    that contract is unresolved. See [the registration blocker](docs/connect-registration-contract.md).
 3. Call `list_environments`, select an explicit environment `id`, then call `list_projects` with
    that id. Project and thread identifiers are scoped to the selected environment.
 4. Use `start_turn` with `environmentId`, `projectId`, and `prompt` for a new thread. Use
@@ -110,13 +112,15 @@ and an ambiguous transport result is `unknown` so the caller can inspect the thr
   replaced. Connect access uses DPoP-bound keys and environment access is never included in MCP output.
 - A failed re-pair leaves the existing registration unchanged.
 
-## Supported contract
+## Compatibility and evidence
 
 See [`docs/compatibility.md`](docs/compatibility.md) for the upstream version and the exact
 descriptor, token exchange, scopes, and session checks used by this package.
 
 Automated compatibility coverage runs an MCP client against the connector process and controlled
-HTTP environments implementing the supported direct-pairing and Connect contracts. No live direct-pairing
+HTTP environments implementing the direct-pairing and controlled relay-JWT contracts. Tests include
+cryptographic DPoP validation and the installed-package turn workflow. They do not prove the hosted
+OAuth handoff or complete the live Connect ticket. No live direct-pairing
 or Connect smoke check was run for this release because this workspace has no operator-authorized
 environment or Connect account; controlled checks must not be read as a claim that a live T3 deployment
 was exercised.

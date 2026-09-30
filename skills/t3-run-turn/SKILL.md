@@ -9,6 +9,11 @@ Use the `t3-mcp` MCP server for the complete workflow. Do not invoke a local tur
 private bot convention. Direct pairing is always available; T3 Connect is an optional operator-driven
 path.
 
+Connect is experimental. If registration reports `upstream_incompatible` for the
+relay-audience JWT, use direct pairing or report the upstream authorization blocker.
+Hosted OAuth login/discovery does not prove registration authorization. Keep credentials
+in the connector's private exchanges; do not export browser/host tokens or keys through MCP.
+
 ## Tools
 
 The connector exposes the six direct workflow tools plus optional T3 Connect tools. Use their MCP
