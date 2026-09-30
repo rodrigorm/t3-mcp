@@ -79,12 +79,22 @@ is an optional debugging utility; this package never invokes `t3-turn`.
 - `list_connect_environments`: no arguments; discovery only.
 - `register_connect_environment`: `environmentId` and optional `label`.
 - `attach_connect_environment`: `environmentId`, `targetEnvironmentId`, and optional `label`.
-- `sign_out_connect`: no arguments; direct registrations are not removed.
+- `sign_out_connect`: no arguments; saved registrations and environment sessions are not removed.
 - `unregister_environment`: `environmentId`.
 
 Pairing URLs use the upstream `?token=...` or `#token=...` form. Direct-pairing responses never include
 the grant, access token, or raw upstream error body. Connect authentication may return a browser
 authorization URL, but not the resulting credentials.
+
+To forget a saved environment, call `unregister_environment` with its `environmentId` from
+`list_environments`. This removes that registration and all of its locally retained direct and
+Connect access. The removal survives connector restarts, and project and turn tools can no longer
+target it. Other saved environments remain usable. Unregistration does not sign out of Connect and
+does not revoke the upstream session. Revoke access in T3 Code if upstream revocation is required.
+
+If unregistration overlaps a re-pair or Connect attachment to the same registration, that exchange
+cannot restore the removed target. If the target changes during an exchange, the exchange returns
+an error and preserves the newer registration. Select the current registration again before retrying.
 
 Mutation acknowledgements are not replayed. A partial result keeps the created thread reference,
 and an ambiguous transport result is `unknown` so the caller can inspect the thread before retrying.
