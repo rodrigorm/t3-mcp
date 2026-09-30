@@ -13,6 +13,9 @@
     "docs/compatibility.md",
     "docs/connect-auth-contract.md",
     "docs/connect-registration-contract.md",
+    "docs/smoke-live.md",
+    "scripts/smoke-live.mjs",
+    "scripts/smoke-connect.mjs",
     "README.md",
     "LICENSE"
   ],

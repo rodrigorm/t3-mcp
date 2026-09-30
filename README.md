@@ -1,7 +1,7 @@
 # t3-mcp
 
 Host-independent MCP connector for directly pairing [T3 Code](https://t3.gg) environments, with
-optional experimental T3 Connect tools. It does not require a host-specific bot setup or a local
+optional EXPERIMENTAL T3 Connect tools. It does not require a host-specific bot setup or a local
 turn CLI.
 
 ## Install
@@ -42,6 +42,7 @@ host-neutral and uses MCP tools rather than shell commands.
    `endpoint` plus `grant`. A pairing URL may carry its grant in a `?token=...` query or
    `#token=...` fragment. T3 Connect is not required.
 2. For the optional Connect path, call `connect_authenticate`, complete the browser flow, and call
+   `connect_authenticate` with `action=status` until authenticated, then call
    `list_connect_environments`. Discovery does not save environments; call
    `register_connect_environment` for a new saved environment or `attach_connect_environment` for
    an existing direct registration. Registration and attachment currently have an upstream
@@ -133,8 +134,15 @@ descriptor, token exchange, scopes, and session checks used by this package.
 
 Automated compatibility coverage runs an MCP client against the connector process and controlled
 HTTP environments implementing the direct-pairing and controlled relay-JWT contracts. Tests include
-cryptographic DPoP validation and the installed-package turn workflow. They do not prove the hosted
+cryptographic DPoP validation, installed-package turns for registration and attachment, lifecycle
+isolation across restart, and the packaged smoke runners. They do not prove the hosted
 OAuth handoff or complete the live Connect ticket. No live direct-pairing
 or Connect smoke check was run for this release because this workspace has no operator-authorized
 environment or Connect account; controlled checks must not be read as a claim that a live T3 deployment
 was exercised.
+
+For repeatable installed-package verification, see [`docs/smoke-live.md`](docs/smoke-live.md).
+The optional runners require explicit targets and use fresh disposable state. They print only
+public browser authorization URLs and safe summary codes. Direct pairing remains the default;
+the Connect live run is blocked on the upstream JWT handoff and operator-authorized resources.
+Public metadata checks and automated fixtures are recorded separately from live evidence.

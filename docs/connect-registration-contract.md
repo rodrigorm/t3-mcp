@@ -9,17 +9,24 @@ optional and experimental. The locally tested implementation does not complete
 Inspected on 2026-09-30 against `pingdotgg/t3code` at:
 
 - Pinned target `7445aa733ada33e45289e5aa5055f79142556513`.
-- Current `main` target `c2fa9fc911daeac97df4760f95fc57dca42b84c8`.
+- Earlier inspected current target `c2fa9fc911daeac97df4760f95fc57dca42b84c8`.
+- `main` resolved during #16 verification to `35be904f2fc40aa6d7a42778b6895e8274f3097f`.
 
-The `tokenApi` exchange handlers are identical at both commits. Current `main`
-was resolved again through GitHub during this implementation.
+The `tokenApi` exchange handlers and hosted authorize builder are identical at all
+three commits. #16 resolved `main` through GitHub and compared the immutable sources.
+This checks the authorization blocker, not the entire current orchestration contract.
 
-| Contract | Immutable source at current target |
+| Contract | Immutable source at earlier inspected target |
 | --- | --- |
 | JWT-only relay exchange, exact resource, allowed client scopes | [relay HTTP handler](https://github.com/pingdotgg/t3code/blob/c2fa9fc911daeac97df4760f95fc57dca42b84c8/infra/relay/src/http/Api.ts#L913-L973) |
 | Hosted OAuth code callback, without a template-JWT handoff | [hosted authorize builder](https://github.com/pingdotgg/t3code/blob/c2fa9fc911daeac97df4760f95fc57dca42b84c8/apps/web/src/cloud/connectCliAuth.ts) |
 | Official interactive client's session-template JWT | [managed auth provider](https://github.com/pingdotgg/t3code/blob/c2fa9fc911daeac97df4760f95fc57dca42b84c8/apps/web/src/cloud/managedAuth.tsx#L78-L82) |
 | Thirty-minute key-bound relay session | [relay tokens](https://github.com/pingdotgg/t3code/blob/c2fa9fc911daeac97df4760f95fc57dca42b84c8/infra/relay/src/auth/RelayTokens.ts) |
+
+The table links the earlier inspected current target. The latest compared handler is
+[`Api.ts` at `35be904`](https://github.com/pingdotgg/t3code/blob/35be904f2fc40aa6d7a42778b6895e8274f3097f/infra/relay/src/http/Api.ts);
+the latest hosted builder is
+[`connectCliAuth.ts` at `35be904`](https://github.com/pingdotgg/t3code/blob/35be904f2fc40aa6d7a42778b6895e8274f3097f/apps/web/src/cloud/connectCliAuth.ts).
 
 Additional pinned contract sources are
 [`EnvironmentConnector.ts`](https://github.com/pingdotgg/t3code/blob/7445aa733ada33e45289e5aa5055f79142556513/infra/relay/src/environments/EnvironmentConnector.ts),
@@ -123,9 +130,32 @@ State remains owner-only, and completed writes leave no temporary files.
 
 The packed-package test explicitly attaches to a direct registration and runs
 project/start/read/continue/read through its Connect session after sign-out and
-relay outage, alongside the new-registration workflow.
+relay outage, alongside the new-registration workflow. It then explicitly logs in,
+unregisters the attached registration, and restarts. All project/turn tools reject
+the removed identity without upstream requests, another registration still works,
+and authentication/discovery remain available. A lost dispatch is unknown and sent once.
 
-#16 can reuse the MCP sequence/assertions, but must replace controlled endpoints and
-fixture-issued JWTs with the verified upstream authorization path. These tests
+The same installed-package test runs both shipped operator smoke scripts through
+public MCP and strict HTTP fixtures. It covers explicit new registration and attachment,
+restart, sign-out access, independent unregistration/account retention, Connect-free direct
+pairing, opaque-token rejection, approval/input stops, and unknown submissions without
+replay. A stale completed snapshot cannot claim continuation completion. Fixtures complete
+the browser callback through HTTP; they do not automate or authenticate a hosted browser.
+
+On 2026-09-30, unauthenticated production relay metadata returned HTTP 200 at both
+`/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource`.
+Their exact issuer/resource is `https://relay.t3.codes`, token endpoint is
+`https://relay.t3.codes/v1/client/dpop-token`, and they declare ES256 and required DPoP
+for the resource. Only allowlisted checks were recorded, not full metadata responses.
+This public observation does not verify OAuth format, JWT delivery, account access, or turns.
+
+Live #16 status is blocked before execution. This process has no operator-authorized
+account, environment, pairing grant, or disposable project/model. The JWT handoff remains
+an upstream prerequisite at the pin and both inspected current targets. Local #15 source
+fixes are implemented; no missing attachment fix is the live blocker. See
+[installed smoke instructions](smoke-live.md) for exact preconditions and the repeatable runner.
+
+#16 live verification must replace controlled endpoints and fixture-issued JWTs with
+the verified upstream authorization path. These tests
 prove local connector behavior, not hosted OAuth JWT delivery, managed tunnel
 provisioning, upstream broker proofs, or a live end-to-end pass.

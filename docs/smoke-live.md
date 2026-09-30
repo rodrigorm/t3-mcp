@@ -1,118 +1,153 @@
-# Live Smoke
+# Installed-package smoke verification
 
-The default smoke uses direct pairing against the local T3 Desktop/server. An optional Connect smoke
-can use the same MCP client after operator authentication. Pairing output, Connect state, and OAuth
-configuration contain credentials; keep them outside the repository and never paste them into logs,
-issues, or commits.
+Direct pairing is the default. Connect is optional and EXPERIMENTAL. These runners are
+optional verification utilities; normal setup and turns use the MCP tools in the host.
+They launch the installed `t3-mcp` stdio command through a real MCP client and contact
+the configured upstream HTTP services. They never invoke a turn CLI.
 
-## Prepare
+## Install the package under test
 
-Run from the repository checkout on the feature branch:
-
-```sh
-npm run build
-npm link
-mkdir -p /tmp/t3-mcp-smoke-state
-chmod 700 /tmp/t3-mcp-smoke-state
-```
-
-Confirm the host is up:
+Use a packed artifact from the integration branch, rather than a globally linked checkout.
+For example, set `SMOKE_INSTALL` to a fresh installation directory and install the selected
+artifact there:
 
 ```sh
-curl -sS --max-time 5 -o /dev/null -w 'status=%{http_code}\n' http://127.0.0.1:3773/
+SMOKE_INSTALL="$(mktemp -d)"
+npm install --prefix "$SMOKE_INSTALL" /absolute/path/to/t3-mcp-0.1.0.tgz
+export T3_MCP_COMMAND="$SMOKE_INSTALL/node_modules/.bin/t3-mcp"
 ```
 
-Mint a short-lived one-time pairing. The exact command is:
+The artifact includes both runners and this guide. Each run creates a fresh owner-only
+temporary state directory and removes it on exit. The runners ignore `T3_MCP_STATE_DIR`
+and never read, copy, repair, or unregister production registrations. They still create
+a real thread and two turns in the explicitly selected upstream project. Use disposable
+operator-authorized resources. Local cleanup does not revoke upstream sessions or delete
+the upstream thread.
+
+Both runners require `T3_MCP_ENVIRONMENT_ID` and `T3_MCP_PROJECT_ID`. There are no private
+host, project, model, or provider defaults and no automatic target selection. The selected
+project must have a default model, or supply both `T3_MCP_MODEL_INSTANCE` and `T3_MCP_MODEL`
+from that environment's available models. Optional `T3_MCP_START_PROMPT` and
+`T3_MCP_CONTINUE_PROMPT` replace the default acknowledgement-only prompts.
+
+`T3_MCP_WAIT_MS` bounds each turn observation, default 120000. `T3_MCP_AUTH_WAIT_MS`
+bounds each browser login, default 600000. `T3_MCP_POLL_MS` controls polling, default 1000.
+All must be positive integers.
+
+## Direct smoke
+
+Obtain a fresh one-time pairing grant from the selected environment through T3 Code.
+Supply either `T3_MCP_PAIRING_URL`, `T3_MCP_PAIRING_FILE`, or both `T3_MCP_ENDPOINT` and
+`T3_MCP_GRANT` through a protected environment. The pairing file may contain QR/CLI output;
+the runner extracts its token-bearing URL privately and preserves the exact endpoint.
+It never substitutes a loopback address for a remote URL.
+
+For a protected pairing file and explicit public identifiers:
 
 ```sh
-t3 pair --ttl 5m --label t3-mcp-live-smoke
+T3_MCP_PAIRING_FILE="$PRIVATE_PAIRING_FILE" \
+T3_MCP_ENVIRONMENT_ID="$SELECTED_ENVIRONMENT_ID" \
+T3_MCP_PROJECT_ID="$DISPOSABLE_PROJECT_ID" \
+node "$SMOKE_INSTALL/node_modules/t3-mcp/scripts/smoke-live.mjs"
 ```
 
-For a no-copy/no-log run, capture the CLI output in a private temporary file and let the smoke
-runner extract the pairing URL without printing it:
+The sequence is `add_environment`, exact identity check, `list_environments`, `list_projects`,
+`start_turn`, `get_thread` until completed, `continue_turn` on that same thread, and
+`get_thread` until the continuation completes. This path needs no Connect configuration.
+
+## Connect smoke
+
+The live run is currently blocked. Hosted OAuth tokens cannot satisfy the relay's JWT-only
+registration exchange without a verified upstream authorization handoff. See
+[the contract and blocker](connect-registration-contract.md). Login/discovery success,
+public metadata availability, and fixture success do not satisfy the live gate.
+
+Before running, provide all of these:
+
+- An upstream-owned public-client authorization contract that privately delivers and renews
+  the relay-compatible subject, or deliberately supports OAuth subjects. The pinned and
+  inspected current upstream do not provide this handoff. A different client ID or re-login
+  does not repair an opaque token.
+- An explicitly authorized Connect account, matching hosted-page OAuth client and token
+  endpoint, and an accepted loopback callback URI on the connector host. The browser must
+  reach that host's callback. Port 34338 is the upstream default; another port requires the
+  OAuth application's redirect policy to allow it.
+- Two explicitly selected, distinct, ready managed `cloudflare_tunnel` environments.
+  `T3_MCP_ENVIRONMENT_ID` is the turn target. `T3_MCP_SANITY_CONNECT_ENVIRONMENT_ID` is
+  a separate registration used to verify that unregistration leaves other access working.
+  Its project list must be nonempty. Discovery never chooses these for the operator.
+- A disposable project and usable model on the turn target. To verify attachment, also
+  supply a fresh direct pairing grant for exactly that target identity.
+
+Configure `T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_CLIENT_ID`, and
+`T3_MCP_CONNECT_TOKEN_ENDPOINT` or `T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY` from the verified
+deployment. Set `T3_MCP_CONNECT_HOSTED_APP_URL` if its hosted page differs from the package's
+public default. Keep grants, callback exchanges, tokens, and private keys outside logs,
+shell history, issue text, and committed files.
+
+Run registration and attachment as separate checks with fresh smoke state:
 
 ```sh
-PAIRING_FILE=/tmp/t3-mcp-live-pairing.txt
-umask 077
-trap 'rm -f "$PAIRING_FILE"' EXIT
-t3 pair --ttl 5m --label t3-mcp-live-smoke >"$PAIRING_FILE" 2>&1
-T3_MCP_STATE_DIR=/tmp/t3-mcp-smoke-state \
-T3_MCP_PAIRING_FILE="$PAIRING_FILE" \
-node scripts/smoke-live.mjs
+T3_MCP_CONNECT_ACTION=register \
+T3_MCP_ENVIRONMENT_ID="$SELECTED_ENVIRONMENT_ID" \
+T3_MCP_SANITY_CONNECT_ENVIRONMENT_ID="$SANITY_ENVIRONMENT_ID" \
+T3_MCP_PROJECT_ID="$DISPOSABLE_PROJECT_ID" \
+node "$SMOKE_INSTALL/node_modules/t3-mcp/scripts/smoke-connect.mjs"
 ```
 
-The runner uses the linked `t3-mcp` command and prints redacted step summaries.
-Select an operator-authorized disposable project with `T3_MCP_PROJECT_ID` and environment with
-`T3_MCP_ENVIRONMENT_ID`. Set `T3_MCP_MODEL_INSTANCE` and `T3_MCP_MODEL` to the selected
-environment's available provider/model. Set `T3_MCP_LOOPBACK_ENDPOINT` when using a different
-local port. Supply these explicitly rather than relying on the script's developer defaults.
-The pairing-file form extracts its grant privately and uses the configured loopback endpoint.
+For attachment, use `T3_MCP_CONNECT_ACTION=attach` and supply the target's protected direct
+pairing input as described above. The runner first pairs the target in its disposable state,
+then explicitly attaches Connect to that exact saved identity. It does not modify an existing
+host registration. `register` and `attach` are required explicit choices.
 
-The first run saves the environment session in `/tmp/t3-mcp-smoke-state`. To re-pair that saved
-environment with a fresh grant, set `T3_MCP_REPAIR_ENVIRONMENT_ID=<environment-id>`.
+The Connect runner performs:
 
-An endpoint plus one-time grant can be used instead of a pairing file:
+1. `connect_authenticate`, print the public PKCE authorization URL, and poll `action=status`.
+   Open the URL and complete browser login. The runner does not export or borrow credentials.
+2. `list_connect_environments` and confirm that discovery leaves saved registrations unchanged.
+3. Explicit registration or stable attachment of the turn target, then explicit registration of
+   the operator-selected sanity environment. Confirm the exact saved registration set.
+4. Project/start/read/continue/read on the chosen project and same thread. Acknowledgement
+   alone is insufficient. Wait for the submitted message, a subsequent non-streaming assistant
+   response, the acknowledged snapshot sequence, and completed status.
+5. Restart the installed connector with the same smoke state and check saved project/thread access.
+6. `sign_out_connect`, confirm signed-out status and discovery rejection, then verify unchanged
+   registrations and valid project/thread access, including the sanity registration.
+7. Authenticate again through a second explicit browser login. This permits an independent
+   check that unregistration preserves the now-active account login.
+8. `unregister_environment` for the turn target, restart, and confirm that its saved registration
+   and project/thread access are gone. Verify the sanity registration still works, authentication
+   is retained, and discovery still works. Discovery may still show the unregistered environment;
+   local unregistration does not unlink it upstream.
 
-```sh
-T3_MCP_STATE_DIR=/tmp/t3-mcp-smoke-state \
-T3_MCP_ENDPOINT=http://127.0.0.1:3773 \
-T3_MCP_GRANT="$ONE_TIME_GRANT" \
-node scripts/smoke-live.mjs
-```
+## Results and evidence
 
-Keep `ONE_TIME_GRANT` in a protected, non-committed environment. Do not put it in this file or in
-shell history.
+Output contains only the public authorization URL and fixed summary codes. It excludes
+grants, tokens, keys, endpoint metadata, labels, IDs, prompts, thread content, and raw errors.
+`smoke_complete=true` and exit status 0 mean the selected sequence finished. A stopped,
+blocked, partial, or unavailable run is not a pass. `accepted` reports a completed check;
+dispatch checks still require later observation.
 
-## Sequence
+On `approval_required` or `input_required`, resolve the request in T3 Code. On an unknown
+submission, inspect the smoke thread in T3 Code before deciding what to do. The runner
+stops without replay or continuation and removes its temporary local state. Do not rerun
+the script to retry an ambiguous mutation. `transport_error` indicates unreachable access;
+`session_expired` indicates invalid environment authorization. Neither proves a Connect
+login problem, and sign-out does not revoke an environment session.
 
-The runner invokes the real MCP process and performs this sequence:
+Record date, package commit/artifact version, exact upstream commit, selected run mode,
+safe summary codes, and exit status separately from credentials. The current evidence is:
 
-1. `add_environment` with the pairing URL, without printing the URL or grant.
-2. `list_environments`.
-3. `list_projects` for the environment that contains the target project.
-4. `start_turn` with a non-mutating acknowledgement prompt.
-5. `get_thread`, waiting for a settled thread when the first read reports `starting` or `running`.
-6. `continue_turn` on the same thread only after a settled, non-error observation.
-7. `get_thread` again, waiting for the continuation to settle without replaying it.
+| Evidence on 2026-09-30 | Status |
+| --- | --- |
+| Installed MCP/HTTP lifecycle and both packaged runners against strict signed-DPoP fixtures | Automated fixture evidence only |
+| Public relay authorization-server and protected-resource metadata | Unauthenticated HTTP 200; exact relay resource/token endpoint and ES256/DPoP declarations match |
+| Real direct workflow | Not run in this process; no authorized endpoint/grant/project supplied |
+| Real Connect registration and attachment workflows | Blocked before live execution; authorization handoff and operator resources unavailable |
 
-Each step reports `outcome=accepted`, `outcome=approval_required`, or `outcome=unknown`. An
-`unknown` mutation is never replayed; inspect the reported thread in T3 Code first. If a thread
-reports `approval_required` or `input_required`, resolve it in T3 Code and observe it again before
-deciding whether any later action is safe.
-
-## Connect smoke, blocked pending upstream authorization
-
-Connect is optional and experimental. The pinned and inspected current upstream relay require
-a `t3-code-relay` audience JWT. Hosted OAuth has no verified private JWT handoff to this package.
-Resolve [the registration blocker](connect-registration-contract.md) before claiming this smoke.
-Controlled HTTP fixture success is not evidence that the hosted login can authorize registration.
-
-After a verified upstream client authorization contract exists, #16 requires an explicitly authorized
-account, selected ready managed `cloudflare_tunnel` environment, and disposable project/model.
-Configure the relay, OAuth token endpoint, and matching hosted-page client through the MCP process
-environment. Keep callback exchanges and credentials private.
-
-Run the installed package through an MCP client:
-
-1. Start `connect_authenticate`, complete the browser flow, and poll sanitized status to success.
-2. Discover and explicitly select one environment. Confirm discovery has not changed saved registrations.
-3. Register a new identity or explicitly attach a matching existing registration. Confirm unrelated
-   registrations survive and the selected environment retains one stable `environmentId`.
-4. List environments and projects, then start a bounded turn in the chosen project.
-5. Read the returned thread until settled. An acknowledgement is not completion.
-6. Continue that same settled thread, then read until the continuation is settled.
-7. Restart the connector and verify registration/session persistence.
-8. Sign out of connector Connect login. Discovery must fail while a valid reachable environment
-   session still permits project/thread reads. Connector sign-out does not unlink the environment's
-   own managed tunnel.
-9. Unregister the selected environment, restart, and verify its local access is gone while unrelated
-   registrations remain usable.
-
-Resolve approvals/user input in T3 Code. Never replay an ambiguous mutation; inspect its retained
-thread/command identifiers. Save only sanitized outcomes and public IDs/version/timestamps.
-Do not borrow host credentials or substitute administrative sessions for operator authorization.
-
-No live direct-pairing or Connect smoke was performed during #14. The automated public MCP and
-installed-package sequences use controlled local HTTP with fixture-issued JWTs and cryptographically
-validated DPoP. #14 remains blocked on authorization handoff; #16 remains blocked on that contract
-and an authorized real account/environment/project.
+Upstream pin is `7445aa733ada33e45289e5aa5055f79142556513`. The earlier inspected current
+target is `c2fa9fc911daeac97df4760f95fc57dca42b84c8`; `main` resolved to
+`35be904f2fc40aa6d7a42778b6895e8274f3097f` during #16 verification. The relay token exchange
+handler and hosted authorize builder are identical at all three targets. This source/metadata
+inspection is not a live authentication or turn pass. #15's local attachment fixes are implemented;
+#16 and the supported-Connect gate remain incomplete.

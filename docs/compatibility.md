@@ -1,9 +1,9 @@
-# Upstream Compatibility
+# Upstream compatibility
 
 The connector implements the direct environment contract evidenced by T3 Code commit
 `7445aa733ada33e45289e5aa5055f79142556513`.
 
-## Pairing Contract
+## Pairing contract
 
 1. Read `GET /.well-known/t3/environment` without credentials.
 2. Require protocol version `1` (an omitted version means `1` in the upstream schema).
@@ -34,8 +34,12 @@ state file.
 
 After authentication, `list_connect_environments` uses the Connect relay for discovery only. The
 connector never saves a discovered environment implicitly. The hosted OAuth flow has no verified
-handoff for the relay-audience JWT required for registration at either the pinned target or current
-`main` commit `c2fa9fc911daeac97df4760f95fc57dca42b84c8`. An incompatible subject produces sanitized
+handoff for the relay-audience JWT required for registration at the pin and inspected current
+targets `c2fa9fc911daeac97df4760f95fc57dca42b84c8` and
+`35be904f2fc40aa6d7a42778b6895e8274f3097f`. The latter was resolved from `main` during
+#16 on 2026-09-30. Their relay token exchange handler and hosted authorize builder are
+identical to the pin. This inspection does not verify the entire current orchestration contract.
+An incompatible subject produces sanitized
 `upstream_incompatible` recovery guidance. See [registration contract and blocker](connect-registration-contract.md).
 
 Against a contract-compatible controlled issuer, `register_connect_environment` or
@@ -56,7 +60,7 @@ environment and all of its stored access paths. Safe reads and mutation prefligh
 alternate retained path after transport failure or revocation. Dispatch never switches paths or
 replays after submission.
 
-## Orchestration Read Contract
+## Orchestration read contract
 
 1. Read `GET /api/orchestration/snapshot` with the saved environment session and map active upstream
    projects' `id` and `title` to public `id` and `name` values.
@@ -69,7 +73,7 @@ replays after submission.
 Thread reads default to 20 user-anchored turns and accept at most 100 per request. Each request is
 bounded by the connector's 10-second timeout and uses only the selected environment's session.
 
-## First-Turn Dispatch Contract
+## First-turn dispatch contract
 
 `start_turn` first reads the selected environment's orchestration snapshot and requires the requested
 active project. The project `defaultModelSelection` supplies the upstream `ModelSelection`. If the
@@ -88,7 +92,7 @@ The MCP result reports acknowledgement separately from completion and never fabr
 If the first turn dispatch fails after creation, the result retains the thread id. Transport or invalid
 acknowledgement failures are `unknown`; the connector never automatically replays either mutation.
 
-## Continuation Dispatch Contract
+## Continuation dispatch contract
 
 `continue_turn` reads the selected thread to reject an already observed active, approval-blocked, or
 input-blocked state. This read is advisory only: the connector still sends one authenticated
@@ -132,7 +136,20 @@ redemption. Attachment coverage includes legacy direct-session retention, same-l
 identity rejection before grant exchange, failed replacements, direct repair retaining Connect,
 restart/sign-out/fallback, and concurrent updates. The packed package also runs
 project/start/read/continue/read for explicit registration and attachment against this controlled
-contract. Fixture JWT issuance does not establish a hosted OAuth handoff or complete the live gate.
+contract. It also rejects the removed registration across restart without upstream requests to
+either former endpoint, verifies another registration's usability, and checks retained Connect
+login/discovery. The packaged generic direct
+and Connect runners use that same installed MCP/HTTP boundary. Runner tests cover explicit targets,
+both registration modes, lifecycle checks, blocked/unknown stops without replay, stale-completion
+rejection, redacted summaries, and isolation from existing state. Fixture JWT issuance does not
+establish a hosted OAuth handoff or complete the live gate.
+
+Unauthenticated production relay metadata returned HTTP 200 on 2026-09-30 and matched the exact
+relay issuer/resource, token endpoint, and ES256/DPoP declarations. No credentialed request or
+live OAuth, registration, attachment, or turn was attempted. #15's local attachment fixes are
+implemented. The remaining blocker is the upstream authorization handoff and unavailable
+operator resources. Connect stays EXPERIMENTAL and #16 remains incomplete. See
+[repeatable smoke instructions and blocked evidence](smoke-live.md).
 
 A live direct-pairing or Connect smoke check against a real T3 environment was not run for this release
 because this workspace has no operator-authorized environment endpoint, grant, or Connect account. No
