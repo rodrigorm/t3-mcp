@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { watch } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -146,7 +147,7 @@ test("refresh cannot silently replace or lose the active Connect account", async
   assert.equal((await call(client, "list_connect_environments")).error?.code, "connect_account_conflict");
   assert.equal((await call(client, "connect_authenticate", { action: "status" })).authentication.error?.code, "connect_account_conflict");
   assert.equal(f.requests.filter((entry) => entry.path === "/v1/environments").length, 0);
-  refreshed = token({ access_token: "opaque", id_token: undefined });
+  refreshed = token({ access_token: "opaque", id_token: "malformed" });
   assert.equal((await call(client, "list_connect_environments")).error?.code, "upstream_incompatible");
   assert.equal((await call(client, "connect_authenticate", { action: "status" })).authentication.status, "failed");
   refreshed = token({ access_token: jwt("account-b"), id_token: jwt("account-a") });
@@ -403,4 +404,96 @@ test("a retained login without account identity requires sign-out before browser
   assert.equal((await call(client, "connect_authenticate", { action: "status" })).authentication.error?.code, "connect_account_conflict");
   await call(client, "sign_out_connect");
   await login(client);
+});
+
+for (const recovery of [false, true]) {
+  test(`cancelling an in-progress auth write survives restart${recovery ? " and preserves the retained recovery login" : ""}`, { timeout: 30_000 }, async (t) => {
+    let reply = token({ expires_in: 30 });
+    const f = await fixture(t, {
+      exchange: (response) => json(response, reply),
+      refresh: (response) => json(response, { error: "temporary_failure" }, 400),
+      discover: (response, request) => json(response, { environments: [record()] }, request.headers.authorization === `Bearer ${jwt("account-a")}` ? 200 : 401),
+    });
+    const client = await f.client();
+    if (recovery) await login(client);
+    const pending = await start(client);
+    if (recovery) {
+      const file = path.join(f.directory, "connect.json");
+      const retained = JSON.parse(await readFile(file, "utf8"));
+      retained.auth.expiresAt = new Date(Date.now() + 3600_000).toISOString();
+      await writeFile(file, JSON.stringify(retained));
+    }
+    // A large controlled response keeps the real atomic write in flight long enough
+    // to cancel over MCP after the OS reports temporary-file creation.
+    reply = token({ access_token: `${jwt("account-a")}rotated`, refresh_token: "r".repeat(64 * 1024 * 1024) });
+    const writing = deferred();
+    const watcher = watch(f.directory, (event, name) => {
+      if (name?.startsWith(".connect-") && name.endsWith(".tmp")) writing.resolve();
+    });
+    t.after(() => watcher.close());
+    const callback = fetch(`${pending.callback}&code=fixture-code`).then((response) => response.text());
+    await writing.promise;
+    assert.equal((await call(client, "connect_authenticate", { action: "cancel" })).authentication.status, "cancelled");
+    await callback;
+    await client.close();
+    const restarted = await f.client();
+    const status = (await call(restarted, "connect_authenticate", { action: "status" })).authentication;
+    assert.equal(status.status, recovery ? "authenticated" : "signed_out");
+    if (recovery) {
+      assert.equal((await call(restarted, "list_connect_environments")).environments?.[0].id, "remote-a");
+    }
+  });
+}
+
+test("a held discovery 401 cannot retire newer rotated credentials", async (t) => {
+  const arrived = deferred();
+  const release = deferred();
+  const rotated = `${jwt("account-a")}rotated`;
+  let discoveries = 0;
+  const f = await fixture(t, {
+    refresh: (response) => json(response, token({ access_token: rotated, refresh_token: "rotated-refresh" })),
+    discover: async (response, request) => {
+      if (++discoveries === 1) { arrived.resolve(); await release.promise; return json(response, {}, 401); }
+      json(response, { environments: [record()] }, request.headers.authorization === `Bearer ${rotated}` ? 200 : 401);
+    },
+  });
+  t.after(release.resolve);
+  const client = await f.client();
+  await login(client);
+  const stale = call(client, "list_connect_environments");
+  await arrived.promise;
+  const file = path.join(f.directory, "connect.json");
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  saved.auth.expiresAt = new Date(Date.now() + 30_000).toISOString();
+  await writeFile(file, JSON.stringify(saved));
+  assert.equal((await call(client, "list_connect_environments")).environments?.[0].id, "remote-a");
+  release.resolve();
+  assert.equal((await stale).error?.code, "connect_auth_expired");
+  assert.equal((await call(client, "connect_authenticate", { action: "status" })).authentication.status, "authenticated");
+  assert.equal((await call(client, "list_connect_environments")).environments?.[0].id, "remote-a");
+  await client.close();
+  const restarted = await f.client();
+  assert.equal((await call(restarted, "list_connect_environments")).environments?.[0].id, "remote-a");
+});
+
+test("opaque refresh without identity retains the pinned account but supplied changed identity is rejected", async (t) => {
+  let refreshed = token({ access_token: "opaque-refreshed", id_token: undefined });
+  const f = await fixture(t, {
+    exchange: (response) => json(response, token({ access_token: "opaque-initial", expires_in: 30 })),
+    refresh: (response) => json(response, refreshed),
+  });
+  const client = await f.client();
+  await login(client);
+  assert.equal((await call(client, "list_connect_environments")).environments?.[0].id, "remote-a");
+  assert.equal((await call(client, "connect_authenticate", { action: "status" })).authentication.status, "authenticated");
+  const file = path.join(f.directory, "connect.json");
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  saved.auth.expiresAt = new Date(Date.now() + 30_000).toISOString();
+  await writeFile(file, JSON.stringify(saved));
+  refreshed = token({ access_token: "opaque-other", id_token: jwt("account-b") });
+  assert.equal((await call(client, "list_connect_environments")).error?.code, "connect_account_conflict");
+  await client.close();
+  const restarted = await f.client();
+  refreshed = token({ access_token: "opaque-again", id_token: undefined });
+  assert.equal((await call(restarted, "list_connect_environments")).environments?.[0].id, "remote-a");
 });

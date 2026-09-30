@@ -41,6 +41,19 @@ function isInside(parent: string, child: string): boolean {
   );
 }
 
+async function ensurePrivateDirectory(directoryPath: string): Promise<void> {
+  try {
+    if (isInside(path.resolve(process.cwd()), directoryPath)) throw invalidStore();
+    await mkdir(directoryPath, { recursive: true, mode: 0o700 });
+    const directory = await lstat(directoryPath);
+    if (!directory.isDirectory() || directory.isSymbolicLink()) throw invalidStore();
+    if (isInside(await realpath(process.cwd()), await realpath(directoryPath))) throw invalidStore();
+    await chmod(directoryPath, 0o700);
+  } catch {
+    throw invalidStore();
+  }
+}
+
 function isPairedEnvironment(value: unknown): value is PairedEnvironment {
   if (!value || typeof value !== "object") return false;
   const environment = value as Record<string, unknown>;
@@ -105,7 +118,7 @@ export class EnvironmentStore {
   private pending: Promise<unknown> = Promise.resolve();
   // Keep deletion revisions so a removed and recreated target invalidates older exchanges.
   private readonly revisions = new Map<string, number>();
-  private readonly snapshots = new WeakMap<PairedEnvironment, number>();
+  private readonly snapshots = new WeakMap<Map<string, PairedEnvironment>, ReadonlyMap<string, number>>();
 
   constructor(directory = defaultStateDirectory()) {
     this.directory = path.resolve(directory);
@@ -113,7 +126,11 @@ export class EnvironmentStore {
   }
 
   async read(): Promise<Map<string, PairedEnvironment>> {
-    return this.serialized(() => this.readCurrent());
+    return this.serialized(async () => {
+      const environments = await this.readCurrent();
+      this.snapshots.set(environments, new Map(this.revisions));
+      return environments;
+    });
   }
 
   private async readCurrent(): Promise<Map<string, PairedEnvironment>> {
@@ -146,7 +163,6 @@ export class EnvironmentStore {
           throw invalidStore();
         }
         environments.set(id, environment);
-        this.snapshots.set(environment, this.revisions.get(id) ?? 0);
       }
       return environments;
     } catch (error) {
@@ -155,17 +171,21 @@ export class EnvironmentStore {
     }
   }
 
-  async save(registration: PairedEnvironment, expected?: PairedEnvironment): Promise<void> {
+  async save(registration: PairedEnvironment, snapshot: Map<string, PairedEnvironment>, assertActive: () => void = () => undefined): Promise<void> {
     await this.serialized(async () => {
+      assertActive();
       const environments = await this.readCurrent();
+      assertActive();
       const id = registration.environmentId;
       const current = environments.get(id);
+      const expected = snapshot.get(id);
+      const expectedRevision = this.snapshots.get(snapshot)?.get(id) ?? 0;
       if (expected) {
         if (!current) {
           throw new ConnectorError("environment_not_found", "The selected environment is no longer saved.");
         }
         if (
-          this.snapshots.get(expected) !== (this.revisions.get(id) ?? 0) ||
+          expectedRevision !== (this.revisions.get(id) ?? 0) ||
           JSON.stringify(current) !== JSON.stringify(expected)
         ) {
           throw new ConnectorError(
@@ -178,14 +198,24 @@ export class EnvironmentStore {
           "environment_exists",
           "An environment with this identifier is already saved; select it explicitly to update access.",
         );
+      } else if (expectedRevision !== (this.revisions.get(id) ?? 0)) {
+        throw new ConnectorError("environment_conflict", "The environment registration changed during pairing; select it again before retrying.");
       }
+      const previous = new Map(environments);
       environments.set(id, registration);
-      await this.replace(environments);
+      await this.replace(environments, assertActive);
+      try {
+        assertActive();
+      } catch (error) {
+        // Cancellation may arrive while the atomic rename is already in flight.
+        await this.replace(previous);
+        throw error;
+      }
       this.revisions.set(id, (this.revisions.get(id) ?? 0) + 1);
     });
   }
 
-  private async replace(environments: Map<string, PairedEnvironment>): Promise<void> {
+  private async replace(environments: Map<string, PairedEnvironment>, assertActive: () => void = () => undefined): Promise<void> {
     await this.ensureDirectory();
     const temporaryPath = path.join(this.directory, `.environments-${process.pid}-${randomUUID()}.tmp`);
     const contents = JSON.stringify(
@@ -206,9 +236,11 @@ export class EnvironmentStore {
         await file.close();
       }
       await chmod(temporaryPath, 0o600);
+      assertActive();
       await rename(temporaryPath, this.filePath);
-    } catch {
+    } catch (error) {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
+      if (error instanceof ConnectorError) throw error;
       throw invalidStore();
     }
   }
@@ -231,22 +263,7 @@ export class EnvironmentStore {
   }
 
   private async ensureDirectory(): Promise<void> {
-    try {
-      if (isInside(path.resolve(process.cwd()), this.directory)) {
-        throw invalidStore();
-      }
-      await mkdir(this.directory, { recursive: true, mode: 0o700 });
-      const directory = await lstat(this.directory);
-      if (!directory.isDirectory() || directory.isSymbolicLink()) {
-        throw invalidStore();
-      }
-      if (isInside(await realpath(process.cwd()), await realpath(this.directory))) {
-        throw invalidStore();
-      }
-      await chmod(this.directory, 0o700);
-    } catch {
-      throw invalidStore();
-    }
+    await ensurePrivateDirectory(this.directory);
   }
 }
 
@@ -282,6 +299,8 @@ export class ConnectStore {
   readonly directory: string;
   readonly filePath: string;
   private revision = 0;
+  private credentialRevision = 0;
+  private readonly snapshots = new WeakMap<ConnectAuth, number>();
   private mutations: Promise<unknown> = Promise.resolve();
 
   get generation(): number {
@@ -294,7 +313,10 @@ export class ConnectStore {
   }
 
   async read(): Promise<ConnectAuth | null> {
-    await this.mutations;
+    return this.mutate(() => this.readCurrent());
+  }
+
+  private async readCurrent(): Promise<ConnectAuth | null> {
     await this.ensureDirectory();
     let raw: string;
     try {
@@ -314,6 +336,7 @@ export class ConnectStore {
       if (parsed.version !== 1 || (parsed.auth !== undefined && !isConnectAuth(parsed.auth))) {
         throw invalidStore();
       }
+      if (parsed.auth) this.snapshots.set(parsed.auth, this.credentialRevision);
       return parsed.auth ?? null;
     } catch (error) {
       if (error instanceof ConnectorError) throw error;
@@ -321,12 +344,31 @@ export class ConnectStore {
     }
   }
 
-  async replace(auth: ConnectAuth, generation = this.revision): Promise<boolean> {
+  async replace(auth: ConnectAuth, generation = this.revision, expected?: ConnectAuth): Promise<boolean> {
     return this.mutate(async () => {
       if (generation !== this.revision) return false;
-      await this.write({ version: 1, auth });
-      return generation === this.revision;
+      const previous = await this.readCurrent();
+      if (expected && (this.snapshots.get(expected) !== this.credentialRevision ||
+        JSON.stringify(previous) !== JSON.stringify(expected))) return false;
+      const active = () => generation === this.revision;
+      if (!active()) return false;
+      if (!(await this.write({ version: 1, auth }, active))) return false;
+      if (active()) {
+        this.credentialRevision += 1;
+        this.snapshots.set(auth, this.credentialRevision);
+        return true;
+      }
+      // Restore the retained login if cancellation raced with rename. All readers
+      // wait for this serialized mutation, including its restoration.
+      if (previous) await this.write({ version: 1, auth: previous });
+      else await rm(this.filePath, { force: true });
+      return false;
     });
+  }
+
+  invalidateWrites(): Promise<void> {
+    this.revision += 1;
+    return this.mutations.then(() => undefined);
   }
 
   async clear(): Promise<boolean> {
@@ -350,7 +392,7 @@ export class ConnectStore {
     return result;
   }
 
-  private async write(value: ConnectStoreFile): Promise<void> {
+  private async write(value: ConnectStoreFile, active: () => boolean = () => true): Promise<boolean> {
     await this.ensureDirectory();
     const temporaryPath = path.join(this.directory, `.connect-${process.pid}-${randomUUID()}.tmp`);
     try {
@@ -362,8 +404,12 @@ export class ConnectStore {
         await file.close();
       }
       await chmod(temporaryPath, 0o600);
+      if (!active()) {
+        await rm(temporaryPath, { force: true });
+        return false;
+      }
       await rename(temporaryPath, this.filePath);
-      await chmod(this.filePath, 0o600);
+      return true;
     } catch {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
       throw invalidStore();
@@ -371,15 +417,6 @@ export class ConnectStore {
   }
 
   private async ensureDirectory(): Promise<void> {
-    try {
-      if (isInside(path.resolve(process.cwd()), this.directory)) throw invalidStore();
-      await mkdir(this.directory, { recursive: true, mode: 0o700 });
-      const directory = await lstat(this.directory);
-      if (!directory.isDirectory() || directory.isSymbolicLink()) throw invalidStore();
-      if (isInside(await realpath(process.cwd()), await realpath(this.directory))) throw invalidStore();
-      await chmod(this.directory, 0o700);
-    } catch {
-      throw invalidStore();
-    }
+    await ensurePrivateDirectory(this.directory);
   }
 }

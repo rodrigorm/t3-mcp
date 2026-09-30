@@ -4,6 +4,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { ConnectorError } from "./errors.js";
 import { createDpopProof, dpopThumbprint, generateDpopKey } from "./dpop.js";
 import { ConnectStore, type ConnectAuth } from "./storage.js";
+import { safePayload } from "./secrets.js";
 import { pairConnectEnvironment } from "./upstream.js";
 import { parseEndpoint } from "./url.js";
 import type { DpopPrivateJwk, PairingResult } from "./types.js";
@@ -257,10 +258,7 @@ function connectErrorForStatus(status: number): ConnectorError {
 
 function parseConnectEnvironment(value: unknown, secrets: readonly string[]): ConnectEnvironment {
   if (!value || typeof value !== "object") throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment.");
-  const metadata = JSON.stringify(value);
-  if (secrets.filter(Boolean).some((secret) => metadata.includes(secret) || metadata.includes(encodeURIComponent(secret)))) {
-    throw new ConnectorError("upstream_incompatible", "T3 Connect returned unsafe environment metadata.");
-  }
+  safePayload(value, secrets);
   const environment = value as Record<string, unknown>;
   const endpoint = environment.endpoint;
   if (
@@ -341,6 +339,8 @@ export class ConnectManager {
     }
     this.requireLifecycle(lifecycle);
 
+    await this.store.invalidateWrites();
+    this.requireLifecycle(lifecycle);
     const settings = config();
     const verifier = randomBase64Url(32);
     const state = randomBase64Url(16);
@@ -396,13 +396,16 @@ export class ConnectManager {
 
   async cancel(): Promise<PublicConnectAuth> {
     this.lifecycle += 1;
+    const drained = this.store.invalidateWrites();
     this.starting = undefined;
     this.stopPending();
-    this.last = publicAuth("cancelled", undefined, {
+    const cancelled = publicAuth("cancelled", undefined, {
       code: "connect_auth_cancelled",
       message: "T3 Connect authorization was cancelled.",
     });
-    return this.last;
+    this.last = cancelled;
+    await drained;
+    return cancelled;
   }
 
   async signOut(): Promise<{ readonly signedOut: boolean }> {
@@ -443,16 +446,26 @@ export class ConnectManager {
     readonly pairing: PairingResult;
     readonly accountId?: string;
     readonly credential: string;
+    readonly assertActive: () => void;
   }> {
     const selectedId = environmentId.trim();
     if (!selectedId) throw new ConnectorError("invalid_input", "environmentId is required.");
     const settings = config();
+    const generation = this.store.generation;
+    const lifecycle = this.lifecycle;
+    const assertActive = () => {
+      this.requireGeneration(generation);
+      this.requireLifecycle(lifecycle);
+    };
     const auth = await this.authToken();
+    assertActive();
     const environments = await this.listEnvironments();
+    assertActive();
     const environment = environments.find((entry) => entry.id === selectedId);
     if (!environment) throw new ConnectorError("connect_environment_not_found", "The selected Connect environment is unavailable.");
 
-    const relayToken = await this.relayAccessToken(settings, auth);
+    const relayToken = await this.relayAccessToken(settings, auth, assertActive);
+    assertActive();
     const key = auth.dpopPrivateJwk;
     const connectUrl = `${settings.relayUrl}v1/environments/${encodeURIComponent(selectedId)}/connect`;
     const connectResponse = await fetchWithTimeout(connectUrl, {
@@ -464,11 +477,13 @@ export class ConnectManager {
       },
       body: JSON.stringify({ clientProofKeyThumbprint: dpopThumbprint(key) }),
     });
+    assertActive();
     if (connectResponse.status === 401) {
       throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay proof or session; verify the upstream DPoP contract or use direct pairing.");
     }
     if (!connectResponse.ok) throw connectErrorForStatus(connectResponse.status);
     const value = await responseJson(connectResponse);
+    assertActive();
     if (!value || typeof value !== "object") {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment credential.");
     }
@@ -495,11 +510,13 @@ export class ConnectManager {
       connectedEnvironment.endpoint,
       result.credential,
     );
-    const pairing = await pairConnectEnvironment(endpoint, key, selectedId);
+    const pairing = await pairConnectEnvironment(endpoint, key, selectedId, assertActive);
+    assertActive();
     return {
       environment: connectedEnvironment,
       pairing,
       credential: result.credential,
+      assertActive,
       ...(auth.accountId ? { accountId: auth.accountId } : {}),
     };
   }
@@ -553,7 +570,7 @@ export class ConnectManager {
       }
       throw connectErrorForStatus(response.status);
     }
-    const token = await this.readTokenResponse(response);
+    const token = await this.readTokenResponse(response, existing.accountId);
     this.requireGeneration(generation);
     if (!existing.accountId || token.accountId !== existing.accountId) {
       throw new ConnectorError("connect_account_conflict", "A different T3 Connect account was returned; sign out before switching accounts.");
@@ -566,13 +583,15 @@ export class ConnectManager {
       dpopPrivateJwk: existing.dpopPrivateJwk,
       accountId: token.accountId,
     };
-    if (!(await this.store.replace(refreshed, generation))) this.requireGeneration(generation);
+    if (!(await this.store.replace(refreshed, generation, existing))) {
+      throw safeAuthFailure("connect_auth_cancelled", "T3 Connect credentials changed during refresh; retry the operation.");
+    }
     this.last = { status: "authenticated" };
     return refreshed;
   }
 
   private async invalidateAuth(auth: ConnectAuth, generation: number): Promise<void> {
-    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), refreshToken: "" }, generation);
+    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), refreshToken: "" }, generation, auth);
     this.requireGeneration(generation);
     if (saved) {
       this.last = publicAuth("failed", undefined, {
@@ -608,7 +627,8 @@ export class ConnectManager {
     }
   }
 
-  private async relayAccessToken(settings: ConnectConfig, auth: ConnectAuth): Promise<string> {
+  private async relayAccessToken(settings: ConnectConfig, auth: ConnectAuth, assertActive: () => void): Promise<string> {
+    assertActive();
     // This is a compatibility preflight, not signature verification. The relay verifies
     // the issuer signature. Hosted OAuth does not provide a verified template-JWT handoff.
     let compatible = false;
@@ -642,11 +662,13 @@ export class ConnectManager {
         client_id: settings.relayClientId,
       }),
     });
+    assertActive();
     if (response.status === 400 || response.status === 401) {
       throw new ConnectorError("upstream_incompatible", "T3 Connect rejected the relay JWT or DPoP exchange; verify the upstream client authorization contract or use direct pairing.");
     }
     if (!response.ok) throw connectErrorForStatus(response.status);
     const value = await responseJson(response);
+    assertActive();
     const relay = value as Record<string, unknown>;
     if (
       !value ||
@@ -665,7 +687,7 @@ export class ConnectManager {
     return relay.access_token as string;
   }
 
-  private async readTokenResponse(response: Response): Promise<OAuthToken> {
+  private async readTokenResponse(response: Response, pinnedAccountId?: string): Promise<OAuthToken> {
     const value = await responseJson(response);
     if (
       !value ||
@@ -690,7 +712,7 @@ export class ConnectManager {
     }
     const accessSubject = decodeJwtSubject(accessToken);
     const idSubject = decodeJwtSubject(typeof token.id_token === "string" ? token.id_token : undefined);
-    const accountId = idSubject ?? accessSubject;
+    const accountId = idSubject ?? accessSubject ?? pinnedAccountId;
     if (!accountId || (accessSubject && idSubject && accessSubject !== idSubject)) {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid account identity.");
     }
@@ -818,7 +840,9 @@ export class ConnectManager {
   ): Promise<void> {
     const pending = this.pending;
     if (!pending || pending !== expected) return;
+    const drained = this.store.invalidateWrites();
     this.stopPending();
     this.last = publicAuth(status, undefined, { code, message });
+    await drained;
   }
 }

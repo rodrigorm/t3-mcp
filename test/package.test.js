@@ -204,6 +204,18 @@ test("runs the packed package through explicit Connect registration, attachment 
       assert.equal(direct.commands.length, before);
     });
 
+    await t.test("attached smoke fails when Connect reads are unavailable despite healthy direct fallback", async () => {
+      attached.state.readStatus = 503;
+      const before = direct.commands.length;
+      try {
+        const result = await smoke("smoke-connect.mjs", { T3_MCP_CONNECT_ACTION: "attach", T3_MCP_ENDPOINT: direct.baseUrl, T3_MCP_GRANT: "direct-grant" });
+        assert.equal(result.code, 1, result.output);
+        assert.match(result.output, /reason=transport_error/);
+        assert.doesNotMatch(result.output, /smoke_complete=true/);
+        assert.equal(direct.commands.length, before);
+      } finally { attached.state.readStatus = 200; }
+    });
+
     await t.test("runner stops after a stale completed observation rather than claiming the continuation settled", async () => {
       const before = attached.commands.length;
       attached.state.dispatch = (command, count) => count === before + 3 ? { body: { sequence: count } } : undefined;

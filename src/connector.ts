@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { ConnectorError } from "./errors.js";
+import { environmentSecrets, safePayload } from "./secrets.js";
 import { ConnectManager, type ConnectEnvironment, type PublicConnectAuth } from "./connect.js";
 import { ConnectStore, EnvironmentStore } from "./storage.js";
 import {
@@ -71,7 +72,7 @@ export interface AttachConnectEnvironmentInput {
 }
 
 function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
-  return {
+  return safePayload({
     id: environment.environmentId,
     label: environment.label,
     endpoint: environment.endpoint,
@@ -82,7 +83,7 @@ function publicEnvironment(environment: PairedEnvironment): PublicEnvironment {
     pairedAt: environment.pairedAt,
     ...(environment.accessSource === "connect" ? { source: "connect" as const } : {}),
     ...(environment.connectAccess ? { connectAttached: true } : {}),
-  };
+  }, environmentSecrets(environment));
 }
 
 function accessFromPairing(pair: {
@@ -283,8 +284,9 @@ export class EnvironmentConnector {
         ? { connectAccountId: environments.get(environmentId)?.connectAccountId }
         : {}),
     };
-    await this.store.save(registration, targetId ? environments.get(targetId) : undefined);
-    return publicEnvironment(registration);
+    const result = publicEnvironment(registration);
+    await this.store.save(registration, environments);
+    return result;
   }
 
   async listEnvironments(): Promise<readonly PublicEnvironment[]> {
@@ -325,8 +327,9 @@ export class EnvironmentConnector {
       connectAccess: access,
       ...(connected.accountId ? { connectAccountId: connected.accountId } : {}),
     };
-    await this.store.save(registration);
-    return publicEnvironment(registration);
+    const result = publicEnvironment(registration);
+    await this.store.save(registration, environments, connected.assertActive);
+    return result;
   }
 
   async attachConnectEnvironment(
@@ -375,8 +378,9 @@ export class EnvironmentConnector {
       connectAccess,
       ...(connected.accountId ? { connectAccountId: connected.accountId } : {}),
     };
-    await this.store.save(registration, existing);
-    return publicEnvironment(registration);
+    const result = publicEnvironment(registration);
+    await this.store.save(registration, environments, connected.assertActive);
+    return result;
   }
 
   async signOutConnect(): Promise<{ readonly signedOut: boolean }> {
