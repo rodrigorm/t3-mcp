@@ -102,6 +102,10 @@ function isDpopPrivateJwk(value: unknown): value is DpopPrivateJwk {
 export class EnvironmentStore {
   readonly directory: string;
   readonly filePath: string;
+  private pending: Promise<unknown> = Promise.resolve();
+  // Keep deletion revisions so a removed and recreated target invalidates older exchanges.
+  private readonly revisions = new Map<string, number>();
+  private readonly snapshots = new WeakMap<PairedEnvironment, number>();
 
   constructor(directory = defaultStateDirectory()) {
     this.directory = path.resolve(directory);
@@ -109,6 +113,10 @@ export class EnvironmentStore {
   }
 
   async read(): Promise<Map<string, PairedEnvironment>> {
+    return this.serialized(() => this.readCurrent());
+  }
+
+  private async readCurrent(): Promise<Map<string, PairedEnvironment>> {
     await this.ensureDirectory();
     let raw: string;
     try {
@@ -138,6 +146,7 @@ export class EnvironmentStore {
           throw invalidStore();
         }
         environments.set(id, environment);
+        this.snapshots.set(environment, this.revisions.get(id) ?? 0);
       }
       return environments;
     } catch (error) {
@@ -146,7 +155,37 @@ export class EnvironmentStore {
     }
   }
 
-  async replace(environments: Map<string, PairedEnvironment>): Promise<void> {
+  async save(registration: PairedEnvironment, expected?: PairedEnvironment): Promise<void> {
+    await this.serialized(async () => {
+      const environments = await this.readCurrent();
+      const id = registration.environmentId;
+      const current = environments.get(id);
+      if (expected) {
+        if (!current) {
+          throw new ConnectorError("environment_not_found", "The selected environment is no longer saved.");
+        }
+        if (
+          this.snapshots.get(expected) !== (this.revisions.get(id) ?? 0) ||
+          JSON.stringify(current) !== JSON.stringify(expected)
+        ) {
+          throw new ConnectorError(
+            "environment_conflict",
+            "The saved environment changed during pairing; select it again before retrying.",
+          );
+        }
+      } else if (current) {
+        throw new ConnectorError(
+          "environment_exists",
+          "An environment with this identifier is already saved; select it explicitly to update access.",
+        );
+      }
+      environments.set(id, registration);
+      await this.replace(environments);
+      this.revisions.set(id, (this.revisions.get(id) ?? 0) + 1);
+    });
+  }
+
+  private async replace(environments: Map<string, PairedEnvironment>): Promise<void> {
     await this.ensureDirectory();
     const temporaryPath = path.join(this.directory, `.environments-${process.pid}-${randomUUID()}.tmp`);
     const contents = JSON.stringify(
@@ -168,7 +207,6 @@ export class EnvironmentStore {
       }
       await chmod(temporaryPath, 0o600);
       await rename(temporaryPath, this.filePath);
-      await chmod(this.filePath, 0o600);
     } catch {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
       throw invalidStore();
@@ -176,10 +214,20 @@ export class EnvironmentStore {
   }
 
   async remove(environmentId: string): Promise<boolean> {
-    const environments = await this.read();
-    if (!environments.delete(environmentId)) return false;
-    await this.replace(environments);
-    return true;
+    return this.serialized(async () => {
+      const environments = await this.readCurrent();
+      if (!environments.delete(environmentId)) return false;
+      await this.replace(environments);
+      this.revisions.set(environmentId, (this.revisions.get(environmentId) ?? 0) + 1);
+      return true;
+    });
+  }
+
+  private serialized<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.pending.then(operation);
+    // A failed write must not prevent later requests from using the store.
+    this.pending = result.catch(() => undefined);
+    return result;
   }
 
   private async ensureDirectory(): Promise<void> {

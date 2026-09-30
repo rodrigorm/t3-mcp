@@ -273,8 +273,7 @@ export class EnvironmentConnector {
         ? { connectAccountId: environments.get(environmentId)?.connectAccountId }
         : {}),
     };
-    environments.set(environmentId, registration);
-    await this.store.replace(environments);
+    await this.store.save(registration, targetId ? environments.get(targetId) : undefined);
     return publicEnvironment(registration);
   }
 
@@ -316,8 +315,7 @@ export class EnvironmentConnector {
       connectAccess: access,
       ...(connected.accountId ? { connectAccountId: connected.accountId } : {}),
     };
-    environments.set(environmentId, registration);
-    await this.store.replace(environments);
+    await this.store.save(registration);
     return publicEnvironment(registration);
   }
 
@@ -366,8 +364,7 @@ export class EnvironmentConnector {
       connectAccess,
       ...(connected.accountId ? { connectAccountId: connected.accountId } : {}),
     };
-    environments.set(targetEnvironmentId, registration);
-    await this.store.replace(environments);
+    await this.store.save(registration, existing);
     return publicEnvironment(registration);
   }
 
