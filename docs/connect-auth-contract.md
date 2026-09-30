@@ -64,7 +64,9 @@ The official web/mobile clients obtain a Clerk session-template JWT instead.
 This is a #14 compatibility blocker, not a reason to substitute credentials or
 change the login/discovery contract. See the pinned relay HTTP implementation
 in `infra/relay/src/http/Api.ts` and the web client in
-`apps/web/src/cloud/managedAuth.tsx`. The same JWT-only exchange remains at current
-`main` commit `c2fa9fc911daeac97df4760f95fc57dca42b84c8`.
+`apps/web/src/cloud/managedAuth.tsx`. The same JWT-only exchange remains at the earlier inspected
+target `c2fa9fc911daeac97df4760f95fc57dca42b84c8` and the later `main` resolved during
+#16 at `35be904f2fc40aa6d7a42778b6895e8274f3097f`. The relay token exchange handler and
+hosted authorize builder are identical at the pin and these two inspected targets.
 See [registration contract and blocker](connect-registration-contract.md) for
 the compatibility guard, local fixture evidence, and remaining upstream work.
