@@ -1,6 +1,10 @@
 # Environment-owned authorization
 
-Direct environment pairing is the required authorization path, independent of T3 Connect. Optional Connect support may provide remote connectivity later, but cannot replace environment authorization or become a prerequisite for direct use.
+Status: Authorization boundary and Connect failure behavior confirmed in the issue #8 design interview. Other pre-existing implementation details below remain draft.
+
+Direct environment pairing remains the required and default authorization path, independent of T3 Connect. Connect is optional for remote connectivity and cannot replace environment-owned authorization or become a prerequisite. Connect login is not an environment session; the environment issues the session used for orchestration.
+
+If an environment session is valid and its endpoint is reachable, the connector continues using it despite Connect failure or login expiry. Require Connect re-login only when Connect is needed for reachability or authentication and the existing environment session cannot be used. Fail clearly without silently falling back to administrative credentials.
 
 ## Consequences
 

@@ -1,5 +1,7 @@
 # Host-independent MCP contract
 
+Status: Draft, reopened for the design interview. The statements below are proposals pending confirmation.
+
 The product is an open-source MCP connector with one generic `t3-run-turn` skill, usable by any compatible MCP host. MCP tools own environment registration, project discovery, turn submission, and thread retrieval; personal bot conventions and local `t3-turn` executables are not dependencies because they would couple adoption to a particular host setup.
 
 ## Consequences
