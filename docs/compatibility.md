@@ -46,6 +46,10 @@ continue to use bearer access tokens.
 
 The selected environment identifier is checked against both the relay response and the environment
 descriptor before the bootstrap is redeemed. The endpoint actually paired is persisted.
+Explicit attachment retains one stable registration and its direct session, including
+pre-Connect version-one state without access-path metadata. Labels never merge identities.
+Direct re-pairing checks the saved identity before grant exchange, selects the repaired direct
+session, and retains any attached Connect access. Failed or stale exchanges preserve current access.
 `sign_out_connect` clears only Connect authentication, while saved
 environment sessions remain available when valid. `unregister_environment` removes the saved
 environment and all of its stored access paths. Safe reads and mutation preflight may select an
@@ -124,8 +128,11 @@ redaction, owner-only storage on all supported platforms, and redirect rejection
 
 The Connect fixture checks exact normalized relay resource, subject JWT signature/audience, ready
 managed-provider eligibility, DPoP signature/claims/token/key binding/replay, and one-use bootstrap
-redemption. The packed package also runs project/start/read/continue/read against this controlled
-contract. Fixture JWT issuance does not establish a hosted OAuth handoff or complete #14/#16.
+redemption. Attachment coverage includes legacy direct-session retention, same-label non-merge,
+identity rejection before grant exchange, failed replacements, direct repair retaining Connect,
+restart/sign-out/fallback, and concurrent updates. The packed package also runs
+project/start/read/continue/read for explicit registration and attachment against this controlled
+contract. Fixture JWT issuance does not establish a hosted OAuth handoff or complete the live gate.
 
 A live direct-pairing or Connect smoke check against a real T3 environment was not run for this release
 because this workspace has no operator-authorized environment endpoint, grant, or Connect account. No

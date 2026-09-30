@@ -208,6 +208,7 @@ export async function startConnectEnvironment(id, options = {}) {
       assert.equal(form.get("requested_token_type"), ACCESS_TYPE);
       assert.equal(form.get("scope"), SCOPES);
       assert.equal(form.has("resource"), false);
+      await state.beforeExchange?.(form);
       const grant = form.get("subject_token");
       const binding = grants.get(grant);
       if (state.rejectGrant || (grant !== "direct-grant" && !binding)) {

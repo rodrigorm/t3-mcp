@@ -55,7 +55,8 @@ are not substitutes. Use independently authorized direct pairing meanwhile.
 Production OAuth audience/format, redirect acceptance, operator account,
 managed remote environment, and disposable project remain unverified. #16 owns
 the authorized installed-package live smoke after this blocker is resolved.
-#15 owns the legacy direct-registration attachment migration bug.
+The same authorization blocker applies to #15 attachment. The local legacy
+direct-registration attachment migration fix is covered below.
 
 ## Implemented registration and session checks
 
@@ -110,8 +111,21 @@ to prove that the fixture rejects them. `test/package.test.js` runs the same
 workflow through the packed and installed package. Existing stdio and unregister
 fixtures reuse the strict control plane and DPoP verifier.
 
-#15 can reuse these helpers for attachment and legacy migration tests. #16 can
-reuse the MCP sequence/assertions, but must replace controlled endpoints and
+`test/connect-attachment.test.js` covers #15 through the same real MCP client,
+stdio process, and strict HTTP fixture. It seeds the supported pre-Connect
+version-one state without access-path metadata and proves that attachment retains
+the direct session through sign-out, restart, and fallback after Connect-session
+revocation. It also exercises the full project/start/read/continue/read workflow,
+same-label non-merge, missing/mismatched identity rejection before grant exchange,
+failed attachment/re-pair preservation, successful direct repair retaining Connect,
+and concurrent attachment/re-pair conflicts preserving the winning registration.
+State remains owner-only, and completed writes leave no temporary files.
+
+The packed-package test explicitly attaches to a direct registration and runs
+project/start/read/continue/read through its Connect session after sign-out and
+relay outage, alongside the new-registration workflow.
+
+#16 can reuse the MCP sequence/assertions, but must replace controlled endpoints and
 fixture-issued JWTs with the verified upstream authorization path. These tests
 prove local connector behavior, not hosted OAuth JWT delivery, managed tunnel
 provisioning, upstream broker proofs, or a live end-to-end pass.

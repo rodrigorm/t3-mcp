@@ -9,7 +9,7 @@ Use the `t3-mcp` MCP server for the complete workflow. Do not invoke a local tur
 private bot convention. Direct pairing is always available; T3 Connect is an optional operator-driven
 path.
 
-Connect is experimental. If registration reports `upstream_incompatible` for the
+Connect is experimental. If registration or attachment reports `upstream_incompatible` for the
 relay-audience JWT, use direct pairing or report the upstream authorization blocker.
 Hosted OAuth login/discovery does not prove registration authorization. Keep credentials
 in the connector's private exchanges; do not export browser/host tokens or keys through MCP.
@@ -66,3 +66,21 @@ schemas as the source of truth.
 Normal adopted workflows use MCP for turns. A local turn CLI can be used by a host for debugging,
 but it is not a package dependency and is not part of this workflow. Connect discovery never implies
 registration; select an environment explicitly, then register or attach it before using turn tools.
+
+## Attach or repair access
+
+1. For an operator-requested attachment, call `list_environments` and
+   `list_connect_environments`. Match the saved `id` to the discovered `environmentId` exactly.
+   Matching labels alone are insufficient. Call `attach_connect_environment` with that identity
+   as both `environmentId` and `targetEnvironmentId`; omit `label` to preserve the saved label.
+2. Confirm that `list_environments` still contains one registration for that id with
+   `connectAttached: true`. Use the same `environmentId` for project and turn tools. Attachment
+   selects Connect access and retains the direct session, including older direct registrations.
+3. To repair direct access, call `add_environment` with the saved `environmentId` and a fresh
+   environment-issued pairing grant. Success selects direct access and retains the attached path.
+   Failed attachment or re-pairing preserves the previous registration. An identity or concurrent
+   update conflict requires selecting the current registration again before retrying.
+
+Saved environment sessions survive restart and `sign_out_connect`. Use the existing project and
+turn tools while a valid endpoint remains reachable. The connector can select a retained alternate
+path during safe reads or mutation preflight; an `unknown` mutation still requires thread inspection.

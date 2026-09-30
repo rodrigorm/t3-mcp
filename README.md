@@ -44,9 +44,10 @@ host-neutral and uses MCP tools rather than shell commands.
 2. For the optional Connect path, call `connect_authenticate`, complete the browser flow, and call
    `list_connect_environments`. Discovery does not save environments; call
    `register_connect_environment` for a new saved environment or `attach_connect_environment` for
-    an existing direct registration. Registration currently has an upstream authentication blocker;
-    hosted OAuth does not provide a verified relay-audience JWT handoff. Use direct pairing while
-    that contract is unresolved. See [the registration blocker](docs/connect-registration-contract.md).
+   an existing direct registration. Registration and attachment currently have an upstream
+   authentication blocker; hosted OAuth does not provide a verified relay-audience JWT handoff.
+   Use direct pairing while that contract is unresolved. See
+   [the registration blocker](docs/connect-registration-contract.md).
 3. Call `list_environments`, select an explicit environment `id`, then call `list_projects` with
    that id. Project and thread identifiers are scoped to the selected environment.
 4. Use `start_turn` with `environmentId`, `projectId`, and `prompt` for a new thread. Use
@@ -87,6 +88,19 @@ is an optional debugging utility; this package never invokes `t3-turn`.
 Pairing URLs use the upstream `?token=...` or `#token=...` form. Direct-pairing responses never include
 the grant, access token, or raw upstream error body. Connect authentication may return a browser
 authorization URL, but not the resulting credentials.
+
+To attach Connect to a saved direct registration, pass the discovered `environmentId` and the
+saved `id` as `targetEnvironmentId` to `attach_connect_environment`. These identifiers must match;
+the connector checks the relay and environment descriptor identities before exchanging the bootstrap.
+Equal labels are not identity evidence. Successful attachment keeps one registration and its stable
+id, preserves the saved label unless `label` is supplied, and selects Connect access while retaining
+the direct session, including registrations saved before Connect existed.
+
+Failed attachment or direct re-pairing preserves the saved access. To repair direct access, call
+`add_environment` with the saved `environmentId` and a fresh environment-issued pairing grant.
+Success selects direct access and retains the attached Connect session. Both paths survive restart
+and Connect sign-out. Safe reads and mutation preflight can use a retained alternate path after
+transport failure or session expiry/revocation; submitted mutations are never replayed on another path.
 
 To forget a saved environment, call `unregister_environment` with its `environmentId` from
 `list_environments`. This removes that registration and all of its locally retained direct and
