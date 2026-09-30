@@ -249,7 +249,7 @@ export class EnvironmentConnector {
     }
 
     const endpoint = parseEndpoint(inputUrl, input.grant, input.pairingUrl !== undefined);
-    const paired = await pairEnvironment(endpoint);
+    const paired = await pairEnvironment(endpoint, targetId);
     const environmentId = paired.descriptor.environmentId;
     const secrets = [endpoint.grant, paired.accessToken];
     const safeEndpoint = publicEndpoint(endpoint.baseUrl);
@@ -353,8 +353,9 @@ export class EnvironmentConnector {
     }
     const endpoint = connected.environment.endpoint;
     const connectAccess = accessFromPairing(connected.pairing, endpoint);
+    // Pre-Connect version-one registrations omit accessSource and hold direct access at the top level.
     const directAccess = existing.directAccess ??
-      (existing.accessSource === "direct" ? {
+      (existing.accessSource !== "connect" ? {
         endpoint: existing.endpoint,
         serverVersion: existing.serverVersion,
         orchestrationProtocolVersion: existing.orchestrationProtocolVersion,

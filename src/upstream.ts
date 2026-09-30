@@ -274,7 +274,9 @@ async function pairWithGrant(
     throw new ConnectorError("upstream_incompatible", "The environment returned unsafe descriptor metadata; use a verified environment endpoint.");
   }
   if (expectedEnvironmentId !== undefined && descriptor.environmentId !== expectedEnvironmentId) {
-    throw new ConnectorError("connect_identity_mismatch", "The environment returned a different identity than Connect selected; select a verified endpoint or use direct pairing.");
+    throw proofKey
+      ? new ConnectorError("connect_identity_mismatch", "The environment returned a different identity than Connect selected; select a verified endpoint or use direct pairing.")
+      : new ConnectorError("environment_conflict", "The paired environment identifier does not match the requested identifier.");
   }
 
   const tokenType = proofKey ? "DPoP" : "Bearer";
@@ -377,8 +379,8 @@ async function pairWithGrant(
   };
 }
 
-export async function pairEnvironment(endpoint: ValidatedEndpoint): Promise<PairingResult> {
-  return pairWithGrant(endpoint);
+export async function pairEnvironment(endpoint: ValidatedEndpoint, expectedEnvironmentId?: string): Promise<PairingResult> {
+  return pairWithGrant(endpoint, undefined, expectedEnvironmentId);
 }
 
 export async function pairConnectEnvironment(

@@ -13,7 +13,7 @@ import { call, login, startConnectControl, startConnectEnvironment, success } fr
 const run = promisify(execFile);
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 
-test("runs the packed package through the public MCP seam and controlled Connect turn workflow", { timeout: 120_000 }, async (t) => {
+test("runs the packed package through explicit Connect registration, attachment and turn workflows", { timeout: 120_000 }, async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-package-"));
   const packDirectory = path.join(temporaryDirectory, "pack");
   const installDirectory = path.join(temporaryDirectory, "install");
@@ -21,8 +21,10 @@ test("runs the packed package through the public MCP seam and controlled Connect
   const packageRoot = path.join(installDirectory, "node_modules", "t3-mcp");
   let client;
   const remote = await startConnectEnvironment("installed-remote");
-  const control = await startConnectControl([remote]);
-  t.after(async () => { await control.close(); await remote.close(); });
+  const direct = await startConnectEnvironment("installed-attached", { label: "Direct" });
+  const attached = await startConnectEnvironment("installed-attached", { label: "Connect" });
+  const control = await startConnectControl([remote, attached]);
+  t.after(async () => { await control.close(); await remote.close(); await direct.close(); await attached.close(); });
 
   try {
     await mkdir(packDirectory);
@@ -116,16 +118,40 @@ test("runs the packed package through the public MCP seam and controlled Connect
     assert.deepEqual(environments.structuredContent ?? JSON.parse(environments.content[0].text), {
       environments: [],
     });
+    const paired = success(await call(client, "add_environment", { endpoint: direct.baseUrl, grant: "direct-grant" })).environment;
     await login(client, control);
+    success(await call(client, "list_connect_environments"));
+    assert.deepEqual(success(await call(client, "list_environments")).environments, [paired]);
     success(await call(client, "register_connect_environment", { environmentId: "installed-remote" }));
-    assert.deepEqual(success(await call(client, "list_projects", { environmentId: "installed-remote" })).projects,
-      [{ id: "project", name: "installed-remote" }]);
-    const start = success(await call(client, "start_turn", { environmentId: "installed-remote", projectId: "project", prompt: "first" })).start;
-    assert.equal(start.outcome, "acknowledged");
-    assert.equal(success(await call(client, "get_thread", { environmentId: "installed-remote", threadId: start.threadId })).thread.status, "completed");
-    const continuation = success(await call(client, "continue_turn", { environmentId: "installed-remote", threadId: start.threadId, prompt: "second" })).continuation;
-    assert.equal(continuation.outcome, "acknowledged");
-    assert.equal(success(await call(client, "get_thread", { environmentId: "installed-remote", threadId: start.threadId })).thread.messages.at(-1).text, "result 2");
+    const attachment = success(await call(client, "attach_connect_environment", {
+      environmentId: "installed-attached", targetEnvironmentId: paired.id,
+    })).environment;
+    assert.equal(attachment.id, paired.id);
+    assert.equal(attachment.label, paired.label);
+    assert.equal(attachment.source, "connect");
+    assert.equal(attachment.connectAttached, true);
+    assert.deepEqual(success(await call(client, "list_environments")).environments.map((entry) => entry.id),
+      ["installed-attached", "installed-remote"]);
+    success(await call(client, "sign_out_connect"));
+    control.state.outage = true;
+    for (const [environmentId, name] of [["installed-remote", "installed-remote"], ["installed-attached", "Connect"]]) {
+      assert.deepEqual(success(await call(client, "list_projects", { environmentId })).projects,
+        [{ id: "project", name }]);
+      const start = success(await call(client, "start_turn", { environmentId, projectId: "project", prompt: "first" })).start;
+      assert.equal(start.environmentId, environmentId);
+      assert.equal(start.outcome, "acknowledged");
+      const read = success(await call(client, "get_thread", { environmentId, threadId: start.threadId })).thread;
+      assert.equal(read.status, "completed");
+      assert.equal(read.messages.at(-1).text, "result 1");
+      const continuation = success(await call(client, "continue_turn", { environmentId, threadId: start.threadId, prompt: "second" })).continuation;
+      assert.equal(continuation.outcome, "acknowledged");
+      assert.equal(continuation.threadId, start.threadId);
+      assert.equal(success(await call(client, "get_thread", { environmentId, threadId: start.threadId })).thread.messages.at(-1).text, "result 2");
+    }
+    assert.equal(direct.commands.length, 0);
+    for (const environment of [remote, attached]) {
+      assert.deepEqual(environment.commands.map((command) => command.type), ["thread.create", "thread.turn.start", "thread.turn.start"]);
+    }
   } finally {
     if (client) await client.close().catch(() => undefined);
     await rm(temporaryDirectory, { recursive: true, force: true });
