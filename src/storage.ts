@@ -221,16 +221,24 @@ function isConnectAuth(value: unknown): value is ConnectAuth {
   return (
     typeof auth.accessToken === "string" &&
     auth.accessToken.length > 0 &&
+    !/\s/.test(auth.accessToken) &&
     typeof auth.refreshToken === "string" &&
     typeof auth.expiresAt === "string" &&
+    Number.isFinite(Date.parse(auth.expiresAt)) &&
     isDpopPrivateJwk(auth.dpopPrivateJwk) &&
-    (auth.accountId === undefined || typeof auth.accountId === "string")
+    (auth.accountId === undefined || (typeof auth.accountId === "string" && auth.accountId.trim().length > 0))
   );
 }
 
 export class ConnectStore {
   readonly directory: string;
   readonly filePath: string;
+  private revision = 0;
+  private mutations: Promise<unknown> = Promise.resolve();
+
+  get generation(): number {
+    return this.revision;
+  }
 
   constructor(directory = defaultStateDirectory()) {
     this.directory = path.resolve(directory);
@@ -238,6 +246,7 @@ export class ConnectStore {
   }
 
   async read(): Promise<ConnectAuth | null> {
+    await this.mutations;
     await this.ensureDirectory();
     let raw: string;
     try {
@@ -264,15 +273,33 @@ export class ConnectStore {
     }
   }
 
-  async replace(auth: ConnectAuth): Promise<void> {
-    await this.write({ version: 1, auth });
+  async replace(auth: ConnectAuth, generation = this.revision): Promise<boolean> {
+    return this.mutate(async () => {
+      if (generation !== this.revision) return false;
+      await this.write({ version: 1, auth });
+      return generation === this.revision;
+    });
   }
 
-  async clear(): Promise<void> {
-    await this.ensureDirectory();
-    await rm(this.filePath, { force: true }).catch(() => {
-      throw invalidStore();
+  async clear(): Promise<boolean> {
+    // Invalidate network work immediately, then clear after any already-started write.
+    this.revision += 1;
+    return this.mutate(async () => {
+      await this.ensureDirectory();
+      try {
+        await rm(this.filePath);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw invalidStore();
+      }
     });
+  }
+
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutations.then(operation);
+    this.mutations = result.catch(() => undefined);
+    return result;
   }
 
   private async write(value: ConnectStoreFile): Promise<void> {

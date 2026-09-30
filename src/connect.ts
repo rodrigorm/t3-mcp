@@ -37,6 +37,7 @@ interface ConnectConfig {
   readonly hostedAppUrl: string;
   readonly clientId: string;
   readonly relayClientId: "t3-web" | "t3-mobile";
+  readonly callbackPort: number;
 }
 
 interface PendingAuthorization {
@@ -47,6 +48,16 @@ interface PendingAuthorization {
   readonly key: DpopPrivateJwk;
   readonly server: HttpServer;
   readonly timer: NodeJS.Timeout;
+  readonly generation: number;
+  exchanging: boolean;
+}
+
+interface OAuthToken {
+  readonly accessToken: string;
+  readonly refreshToken: string;
+  readonly expiresAt: string;
+  readonly accountId: string;
+  readonly idToken?: string;
 }
 
 function firstSetting(...names: string[]): string | undefined {
@@ -111,6 +122,11 @@ function tokenEndpointFromPublishableKey(key: string): string {
 }
 
 function config(): ConnectConfig {
+  const callbackPortSetting = firstSetting("T3_MCP_CONNECT_CALLBACK_PORT") ?? "34338";
+  const callbackPort = Number(callbackPortSetting);
+  if (!/^\d{1,5}$/.test(callbackPortSetting) || callbackPort > 65535) {
+    throw new ConnectorError("connect_not_configured", "The T3 Connect callback port configuration is invalid.");
+  }
   const relayUrl = normalizedUrl(
     requiredSetting("T3_MCP_CONNECT_RELAY_URL", "T3_MCP_RELAY_URL", "T3CODE_RELAY_URL"),
     true,
@@ -143,6 +159,7 @@ function config(): ConnectConfig {
       "T3CODE_CLERK_CLI_OAUTH_CLIENT_ID",
     ),
     relayClientId: firstSetting("T3_MCP_RELAY_CLIENT_ID") === "t3-mobile" ? "t3-mobile" : "t3-web",
+    callbackPort,
   };
 }
 
@@ -193,11 +210,15 @@ async function closeServer(server: HttpServer): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-async function listen(server: HttpServer): Promise<number> {
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
+async function listen(server: HttpServer, port: number): Promise<number> {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, "127.0.0.1", () => resolve());
+    });
+  } catch {
+    throw new ConnectorError("connect_auth_failed", "The local Connect callback could not start; check that its configured port is available.");
+  }
   const address = server.address();
   if (!address || typeof address === "string") {
     await closeServer(server);
@@ -234,8 +255,12 @@ function connectErrorForStatus(status: number): ConnectorError {
   return new ConnectorError("connect_unavailable", "T3 Connect rejected the request.");
 }
 
-function parseConnectEnvironment(value: unknown): ConnectEnvironment {
+function parseConnectEnvironment(value: unknown, secrets: readonly string[]): ConnectEnvironment {
   if (!value || typeof value !== "object") throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment.");
+  const metadata = JSON.stringify(value);
+  if (secrets.filter(Boolean).some((secret) => metadata.includes(secret) || metadata.includes(encodeURIComponent(secret)))) {
+    throw new ConnectorError("upstream_incompatible", "T3 Connect returned unsafe environment metadata.");
+  }
   const environment = value as Record<string, unknown>;
   const endpoint = environment.endpoint;
   if (
@@ -244,6 +269,7 @@ function parseConnectEnvironment(value: unknown): ConnectEnvironment {
     typeof environment.label !== "string" ||
     !environment.label.trim() ||
     typeof environment.linkedAt !== "string" ||
+    !environment.linkedAt.trim() ||
     !endpoint ||
     typeof endpoint !== "object"
   ) {
@@ -253,11 +279,20 @@ function parseConnectEnvironment(value: unknown): ConnectEnvironment {
   if (
     typeof endpointRecord.httpBaseUrl !== "string" ||
     typeof endpointRecord.wsBaseUrl !== "string" ||
-    !["manual", "cloudflare_tunnel", "t3_relay"].includes(String(endpointRecord.providerKind))
+    typeof endpointRecord.providerKind !== "string" ||
+    !["manual", "cloudflare_tunnel", "t3_relay"].includes(endpointRecord.providerKind)
   ) {
     throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment endpoint.");
   }
-  const httpBaseUrl = normalizedUrl(endpointRecord.httpBaseUrl, true);
+  let httpBaseUrl: string;
+  try {
+    httpBaseUrl = normalizedUrl(endpointRecord.httpBaseUrl, true);
+    const wsUrl = new URL(endpointRecord.wsBaseUrl);
+    if (!["ws:", "wss:"].includes(wsUrl.protocol)) throw new Error();
+    normalizedUrl(wsUrl.toString().replace(/^ws/, "http"), true);
+  } catch {
+    throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment endpoint.");
+  }
   return {
     id: environment.environmentId.trim(),
     label: environment.label.trim(),
@@ -269,15 +304,42 @@ function parseConnectEnvironment(value: unknown): ConnectEnvironment {
 export class ConnectManager {
   private pending: PendingAuthorization | undefined;
   private last: PublicConnectAuth = { status: "signed_out" };
+  private lifecycle = 0;
+  private starting: Promise<PublicConnectAuth> | undefined;
+  private readonly secrets = new Set<string>();
+  private refreshing: { readonly generation: number; readonly token: Promise<ConnectAuth> } | undefined;
 
   constructor(private readonly store: ConnectStore) {}
 
   async authenticate(action: "start" | "status" | "cancel" = "start"): Promise<PublicConnectAuth> {
     if (action === "status") return this.status();
     if (action === "cancel") return this.cancel();
+    if (this.starting) return this.starting;
+    const starting = this.startAuthentication();
+    this.starting = starting;
+    try {
+      return await starting;
+    } finally {
+      if (this.starting === starting) this.starting = undefined;
+    }
+  }
 
-    if (await this.store.read()) return { status: "authenticated" };
+  private async startAuthentication(): Promise<PublicConnectAuth> {
+    const lifecycle = this.lifecycle;
     if (this.pending) return publicAuth("pending", this.pending);
+    const existing = await this.store.read();
+    if (existing) {
+      try {
+        await this.authToken();
+        this.requireLifecycle(lifecycle);
+        return { status: "authenticated" };
+      } catch (error) {
+        if (!(error instanceof ConnectorError) || !["connect_auth_expired", "upstream_incompatible"].includes(error.code)) {
+          throw error;
+        }
+      }
+    }
+    this.requireLifecycle(lifecycle);
 
     const settings = config();
     const verifier = randomBase64Url(32);
@@ -286,7 +348,11 @@ export class ConnectManager {
     const server = createHttpServer((request, response) => {
       void this.handleCallback(request, response);
     });
-    const port = await listen(server);
+    const port = await listen(server, settings.callbackPort);
+    if (lifecycle !== this.lifecycle) {
+      await closeServer(server);
+      this.requireLifecycle(lifecycle);
+    }
     const expiresAt = new Date(Date.now() + AUTH_TIMEOUT_MS).toISOString();
     const authorizationUrl = new URL("/connect", settings.hostedAppUrl);
     authorizationUrl.hash = new URLSearchParams([
@@ -300,9 +366,11 @@ export class ConnectManager {
       authorizationUrl: authorizationUrl.toString(),
       expiresAt,
       key,
+      generation: this.store.generation,
+      exchanging: false,
       server,
       timer: setTimeout(() => {
-        void this.expirePending();
+        void this.finishPending("failed", "connect_auth_expired", "T3 Connect authorization expired; authenticate again.", pending);
       }, AUTH_TIMEOUT_MS),
     };
     this.pending = pending;
@@ -312,16 +380,24 @@ export class ConnectManager {
 
   async status(): Promise<PublicConnectAuth> {
     if (this.pending) return publicAuth("pending", this.pending);
-    if (await this.store.read()) return { status: "authenticated" };
+    const existing = await this.store.read();
+    if (existing) {
+      if (this.last.status === "failed") return this.last;
+      if (Date.parse(existing.expiresAt) <= Date.now()) {
+        return publicAuth("failed", undefined, {
+          code: "connect_auth_expired",
+          message: "T3 Connect authentication expired; authenticate again.",
+        });
+      }
+      return { status: "authenticated" };
+    }
     return this.last;
   }
 
   async cancel(): Promise<PublicConnectAuth> {
-    if (this.pending) {
-      clearTimeout(this.pending.timer);
-      await closeServer(this.pending.server);
-      this.pending = undefined;
-    }
+    this.lifecycle += 1;
+    this.starting = undefined;
+    this.stopPending();
     this.last = publicAuth("cancelled", undefined, {
       code: "connect_auth_cancelled",
       message: "T3 Connect authorization was cancelled.",
@@ -330,26 +406,36 @@ export class ConnectManager {
   }
 
   async signOut(): Promise<{ readonly signedOut: boolean }> {
-    await this.cancel();
-    const existing = await this.store.read();
-    if (existing) await this.store.clear();
-    this.last = { status: "signed_out" };
-    return { signedOut: existing !== null };
+    const cancelled = this.cancel();
+    const lifecycle = this.lifecycle;
+    this.secrets.clear();
+    const clearing = this.store.clear();
+    await cancelled;
+    const signedOut = await clearing;
+    if (lifecycle === this.lifecycle && !this.pending) this.last = { status: "signed_out" };
+    return { signedOut };
   }
 
   async listEnvironments(): Promise<readonly ConnectEnvironment[]> {
+    const generation = this.store.generation;
     const settings = config();
     const auth = await this.authToken();
     const response = await fetchWithTimeout(`${settings.relayUrl}v1/environments`, {
       method: "GET",
       headers: { authorization: `Bearer ${auth.accessToken}` },
     });
-    if (!response.ok) throw connectErrorForStatus(response.status);
+    this.requireGeneration(generation);
+    if (!response.ok) {
+      if (response.status === 401) await this.invalidateAuth(auth, generation);
+      throw connectErrorForStatus(response.status);
+    }
     const value = await responseJson(response);
+    this.requireGeneration(generation);
     if (!value || typeof value !== "object" || !Array.isArray((value as Record<string, unknown>).environments)) {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid environment list.");
     }
-    return (value as { environments: unknown[] }).environments.map(parseConnectEnvironment);
+    const secrets = [...this.secrets, auth.accessToken, auth.refreshToken, auth.dpopPrivateJwk.d];
+    return (value as { environments: unknown[] }).environments.map((entry) => parseConnectEnvironment(entry, secrets));
   }
 
   async connectEnvironment(environmentId: string): Promise<{
@@ -411,10 +497,35 @@ export class ConnectManager {
   }
 
   private async authToken(): Promise<ConnectAuth> {
+    const generation = this.store.generation;
+    if (this.refreshing?.generation === generation) return this.refreshing.token;
+    const token = this.loadAuthToken(generation);
+    this.refreshing = { generation, token };
+    try {
+      return await token;
+    } catch (error) {
+      if (
+        generation === this.store.generation &&
+        error instanceof ConnectorError &&
+        ["connect_auth_expired", "connect_account_conflict", "upstream_incompatible"].includes(error.code)
+      ) {
+        this.last = publicAuth("failed", undefined, { code: error.code, message: error.message });
+      }
+      throw error;
+    } finally {
+      if (this.refreshing?.token === token) this.refreshing = undefined;
+    }
+  }
+
+  private async loadAuthToken(generation: number): Promise<ConnectAuth> {
     const existing = await this.store.read();
+    this.requireGeneration(generation);
     if (!existing) throw new ConnectorError("connect_auth_expired", "Authenticate with T3 Connect before using Connect environments.");
     if (Date.parse(existing.expiresAt) > Date.now() + AUTH_REFRESH_WINDOW_MS) return existing;
-    if (!existing.refreshToken) throw new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
+    if (!existing.refreshToken) {
+      if (Date.parse(existing.expiresAt) > Date.now()) return existing;
+      throw new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
+    }
 
     const settings = config();
     const response = await fetchWithTimeout(settings.tokenEndpoint, {
@@ -426,19 +537,67 @@ export class ConnectManager {
         client_id: settings.clientId,
       }),
     });
-    if (!response.ok) throw new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
+    this.requireGeneration(generation);
+    if (!response.ok) {
+      if (response.status === 400 || response.status === 401) {
+        await this.invalidateAuth(existing, generation);
+        throw new ConnectorError("connect_auth_expired", "T3 Connect authentication expired; authenticate again.");
+      }
+      throw connectErrorForStatus(response.status);
+    }
     const token = await this.readTokenResponse(response);
+    this.requireGeneration(generation);
+    if (!existing.accountId || token.accountId !== existing.accountId) {
+      throw new ConnectorError("connect_account_conflict", "A different T3 Connect account was returned; sign out before switching accounts.");
+    }
+    this.rememberToken(token);
     const refreshed: ConnectAuth = {
       accessToken: token.accessToken,
       refreshToken: token.refreshToken || existing.refreshToken,
       expiresAt: token.expiresAt,
       dpopPrivateJwk: existing.dpopPrivateJwk,
-      ...(existing.accountId || token.accountId
-        ? { accountId: token.accountId ?? existing.accountId }
-        : {}),
+      accountId: token.accountId,
     };
-    await this.store.replace(refreshed);
+    if (!(await this.store.replace(refreshed, generation))) this.requireGeneration(generation);
+    this.last = { status: "authenticated" };
     return refreshed;
+  }
+
+  private async invalidateAuth(auth: ConnectAuth, generation: number): Promise<void> {
+    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), refreshToken: "" }, generation);
+    this.requireGeneration(generation);
+    if (saved) {
+      this.last = publicAuth("failed", undefined, {
+        code: "connect_auth_expired",
+        message: "T3 Connect authentication expired; authenticate again.",
+      });
+    }
+  }
+
+  private requireGeneration(generation: number): void {
+    if (generation !== this.store.generation) {
+      throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization is no longer active.");
+    }
+  }
+
+  private requireLifecycle(lifecycle: number): void {
+    if (lifecycle !== this.lifecycle) {
+      throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization is no longer pending.");
+    }
+  }
+
+  private stopPending(): void {
+    const pending = this.pending;
+    this.pending = undefined;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    if (pending.server.listening) pending.server.close(() => undefined);
+  }
+
+  private rememberToken(token: { readonly accessToken: string; readonly refreshToken: string; readonly idToken?: string }): void {
+    for (const secret of [token.accessToken, token.refreshToken, token.idToken]) {
+      if (secret) this.secrets.add(secret);
+    }
   }
 
   private async relayAccessToken(settings: ConnectConfig, auth: ConnectAuth): Promise<string> {
@@ -474,12 +633,7 @@ export class ConnectManager {
     return relay.access_token as string;
   }
 
-  private async readTokenResponse(response: Response): Promise<{
-    readonly accessToken: string;
-    readonly refreshToken: string;
-    readonly expiresAt: string;
-    readonly accountId?: string;
-  }> {
+  private async readTokenResponse(response: Response): Promise<OAuthToken> {
     const value = await responseJson(response);
     if (
       !value ||
@@ -492,15 +646,28 @@ export class ConnectManager {
     const token = value as Record<string, unknown>;
     const accessToken = token.access_token as string;
     const expiresIn = token.expires_in;
-    if (typeof expiresIn !== "number" || expiresIn <= 0) {
+    if (
+      !accessToken.trim() || /\s/.test(accessToken) ||
+      typeof token.token_type !== "string" || token.token_type.toLowerCase() !== "bearer" ||
+      (token.refresh_token !== undefined && typeof token.refresh_token !== "string") ||
+      (token.id_token !== undefined && (typeof token.id_token !== "string" || !decodeJwtSubject(token.id_token))) ||
+      typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0 ||
+      !Number.isFinite(new Date(Date.now() + expiresIn * 1_000).getTime())
+    ) {
       throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid authentication response.");
     }
-    const accountId = decodeJwtSubject(typeof token.id_token === "string" ? token.id_token : accessToken);
+    const accessSubject = decodeJwtSubject(accessToken);
+    const idSubject = decodeJwtSubject(typeof token.id_token === "string" ? token.id_token : undefined);
+    const accountId = idSubject ?? accessSubject;
+    if (!accountId || (accessSubject && idSubject && accessSubject !== idSubject)) {
+      throw new ConnectorError("upstream_incompatible", "T3 Connect returned an invalid account identity.");
+    }
     return {
       accessToken,
       refreshToken: typeof token.refresh_token === "string" ? token.refresh_token : "",
       expiresAt: new Date(Date.now() + expiresIn * 1_000).toISOString(),
-      ...(accountId ? { accountId } : {}),
+      accountId,
+      ...(typeof token.id_token === "string" ? { idToken: token.id_token } : {}),
     };
   }
 
@@ -520,24 +687,38 @@ export class ConnectManager {
       response.end();
       return;
     }
-    if (url.searchParams.get("state") !== pending.state) {
+    if (request.method !== "GET") {
+      response.writeHead(405, { allow: "GET" });
+      response.end();
+      return;
+    }
+    if (url.searchParams.getAll("state").length !== 1 || url.searchParams.get("state") !== pending.state) {
       response.writeHead(400, { "content-type": "text/plain" });
       response.end("Invalid T3 Connect authorization callback.");
       return;
     }
+    if (pending.exchanging) {
+      response.writeHead(409, { "content-type": "text/plain" });
+      response.end("T3 Connect authorization is already being completed.");
+      return;
+    }
     const error = url.searchParams.get("error");
     if (error) {
-      await this.finishPending("failed", "connect_auth_failed", "T3 Connect authorization was denied.");
+      const expired = error === "expired_token" || error === "login_required";
+      await this.finishPending("failed", expired ? "connect_auth_expired" : "connect_auth_failed",
+        expired ? "T3 Connect authorization expired; authenticate again." : "T3 Connect authorization was denied.", pending);
       response.writeHead(200, { "content-type": "text/plain" });
       response.end("T3 Connect authorization was not completed. You may close this window.");
       return;
     }
     const code = url.searchParams.get("code");
-    if (!code) {
+    if (!code?.trim() || url.searchParams.getAll("code").length !== 1) {
+      await this.finishPending("failed", "connect_auth_failed", "T3 Connect returned an invalid authorization callback.", pending);
       response.writeHead(400, { "content-type": "text/plain" });
       response.end("Invalid T3 Connect authorization callback.");
       return;
     }
+    pending.exchanging = true;
     try {
       const settings = config();
       const tokenResponse = await fetchWithTimeout(settings.tokenEndpoint, {
@@ -553,7 +734,7 @@ export class ConnectManager {
       });
       if (!tokenResponse.ok) throw safeAuthFailure("connect_auth_failed", "T3 Connect authorization failed.");
       const token = await this.readTokenResponse(tokenResponse);
-      await this.finishPendingWithToken(token, pending.key);
+      await this.finishPendingWithToken(token, pending);
       response.writeHead(200, { "content-type": "text/plain" });
       response.end("T3 Connect authorization completed. You may close this window.");
     } catch (callbackError) {
@@ -561,45 +742,39 @@ export class ConnectManager {
         callbackError instanceof ConnectorError && callbackError.code === "connect_auth_expired"
           ? "connect_auth_expired"
           : "connect_auth_failed";
-      if (this.pending) {
-        await this.finishPending("failed", failureCode, "T3 Connect authorization failed.");
-      } else {
-        this.last = publicAuth("failed", undefined, {
-          code: failureCode,
-          message: "T3 Connect authorization failed.",
-        });
-      }
+      await this.finishPending("failed", failureCode, "T3 Connect authorization failed.", pending);
       response.writeHead(200, { "content-type": "text/plain" });
       response.end("T3 Connect authorization failed. You may close this window.");
     }
   }
 
   private async finishPendingWithToken(
-    token: { readonly accessToken: string; readonly refreshToken: string; readonly expiresAt: string; readonly accountId?: string },
-    key: DpopPrivateJwk,
+    token: OAuthToken,
+    pending: PendingAuthorization,
   ): Promise<void> {
-    const pending = this.pending;
-    if (!pending) {
+    if (this.pending !== pending) {
       throw safeAuthFailure("connect_auth_expired", "T3 Connect authorization is no longer pending.");
     }
-    clearTimeout(pending.timer);
-    if (pending.server.listening) pending.server.close(() => undefined);
-    this.pending = undefined;
     const existing = await this.store.read();
-    if (existing && token.accountId && existing.accountId && token.accountId !== existing.accountId) {
+    if (this.pending !== pending) throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization was cancelled.");
+    if (existing && (!existing.accountId || token.accountId !== existing.accountId)) {
+      this.stopPending();
       this.last = publicAuth("failed", undefined, {
         code: "connect_account_conflict",
         message: "A different T3 Connect account is already active; sign out before switching accounts.",
       });
-      return;
+      throw new ConnectorError("connect_account_conflict", "Sign out of T3 Connect before switching accounts.");
     }
-    await this.store.replace({
+    this.rememberToken(token);
+    const saved = await this.store.replace({
       accessToken: token.accessToken,
       refreshToken: token.refreshToken,
       expiresAt: token.expiresAt,
-      dpopPrivateJwk: key,
-      ...(token.accountId ? { accountId: token.accountId } : {}),
-    });
+      dpopPrivateJwk: pending.key,
+      accountId: token.accountId,
+    }, pending.generation);
+    if (!saved || this.pending !== pending) throw safeAuthFailure("connect_auth_cancelled", "T3 Connect authorization was cancelled.");
+    this.stopPending();
     this.last = { status: "authenticated" };
   }
 
@@ -607,16 +782,11 @@ export class ConnectManager {
     status: "failed" | "cancelled",
     code: "connect_auth_failed" | "connect_auth_expired" | "connect_auth_cancelled",
     message: string,
+    expected = this.pending,
   ): Promise<void> {
     const pending = this.pending;
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    if (pending.server.listening) pending.server.close(() => undefined);
-    this.pending = undefined;
+    if (!pending || pending !== expected) return;
+    this.stopPending();
     this.last = publicAuth(status, undefined, { code, message });
-  }
-
-  private async expirePending(): Promise<void> {
-    await this.finishPending("failed", "connect_auth_expired", "T3 Connect authorization expired; authenticate again.");
   }
 }
