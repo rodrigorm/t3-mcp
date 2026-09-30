@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -209,6 +209,22 @@ export async function runSmoke(mode = "direct") {
       accepted(action === "attach" ? "stable_attachment" : "explicit_registration");
       const sanity = (await call(client, "register_connect_environment", { environmentId: sanityId })).environment;
       requireThat(sanity?.id === sanityId, "sanity_identity_mismatch");
+      if (action === "attach") {
+        // Prove public attachment first, then remove fallback only from this runner's
+        // disposable state. Every workflow read/dispatch must use the attached path.
+        await client.close();
+        const file = path.join(directory, "environments.json");
+        const state = JSON.parse(await readFile(file, "utf8"));
+        const registration = state.environments?.[environmentId];
+        requireThat(registration?.environmentId === environmentId && registration.accessSource === "connect" &&
+          registration.connectAccess && registration.directAccess, "connect_path_not_attached");
+        delete registration.directAccess;
+        const temporary = path.join(directory, ".smoke-connect-only.tmp");
+        await writeFile(temporary, `${JSON.stringify(state)}\n`, { flag: "wx", mode: 0o600 });
+        await rename(temporary, file);
+        await connect();
+        accepted("connect_only_access");
+      }
     }
     await assertIds(client, sanityId ? [environmentId, sanityId] : [environmentId]);
     accepted("list_environments");

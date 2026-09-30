@@ -100,6 +100,13 @@ pairing input as described above. The runner first pairs the target in its dispo
 then explicitly attaches Connect to that exact saved identity. It does not modify an existing
 host registration. `register` and `attach` are required explicit choices.
 
+After proving stable attachment through MCP, the runner stops the connector and removes
+the target's direct fallback from the runner's own disposable state. It retains the
+attached Connect session and the same `environmentId`, then restarts the installed
+connector before project and turn checks. `connect_only_access outcome=accepted` records
+this preparation. This prevents healthy direct access from hiding a broken attached path.
+Normal connector access selection and fallback remain available outside this isolated run.
+
 The Connect runner performs:
 
 1. `connect_authenticate`, print the public PKCE authorization URL, and poll `action=status`.
@@ -141,6 +148,7 @@ safe summary codes, and exit status separately from credentials. The current evi
 | Evidence on 2026-09-30 | Status |
 | --- | --- |
 | Installed MCP/HTTP lifecycle and both packaged runners against strict signed-DPoP fixtures | Automated fixture evidence only |
+| Attachment runner with Connect reads returning 503 and healthy direct access | Stops with `transport_error`; no completion claim or direct dispatch |
 | Public relay authorization-server and protected-resource metadata | Unauthenticated HTTP 200; exact relay resource/token endpoint and ES256/DPoP declarations match |
 | Real direct workflow | Not run in this process; no authorized endpoint/grant/project supplied |
 | Real Connect registration and attachment workflows | Blocked before live execution; authorization handoff and operator resources unavailable |

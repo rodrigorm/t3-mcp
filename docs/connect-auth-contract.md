@@ -18,7 +18,8 @@ Verified before the #12 changes against `pingdotgg/t3code` commit
   and `code_verifier`. Refresh uses `grant_type=refresh_token`, `refresh_token`,
   and `client_id`. Responses contain `access_token`, `token_type`, `expires_in`,
   and optional `refresh_token` and `id_token`. Omitted refresh tokens retain the
-  previous refresh token. Browser authorization expires after ten minutes.
+  previous refresh token. Its `refresh` operation also retains the previous identity
+  when the refresh response omits identity. Browser authorization expires after ten minutes.
 - `packages/contracts/src/relay.ts` defines bearer-authenticated
   `GET /v1/environments` with an `environments` array. Each record contains
   `environmentId`, `label`, `linkedAt`, and an endpoint with `httpBaseUrl`,
@@ -38,6 +39,18 @@ or rejected credentials, start authentication again. A retained account is pinne
 until `sign_out_connect`; authenticating as another account requires sign-out first.
 Account comparison uses token subjects received from the configured TLS token endpoint;
 decoding a subject locally is not independent JWT signature verification.
+
+Initial authentication requires an account subject from the access token or ID token.
+An opaque refreshed access token without an ID token retains the already pinned account.
+A supplied subject must still match that account, and conflicting or malformed identity
+claims fail. Refresh and discovery rejection update credentials only if the serialized
+store still holds the credential snapshot that made the request. A stale 401 cannot
+overwrite a newer rotated login or mark it failed.
+
+Cancellation and pending authorization expiry invalidate queued and in-progress login
+writes. Cancellation preserves any previously retained login. Sign-out also clears that
+login. Registration checks the captured account generation and authorization lifecycle
+after each network boundary and again during the serialized registration save.
 
 The callback defaults to upstream's documented port `34338`.
 `T3_MCP_CONNECT_CALLBACK_PORT` can select another port, or `0` for an OS-assigned

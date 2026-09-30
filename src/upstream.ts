@@ -1,5 +1,6 @@
 import { ConnectorError } from "./errors.js";
 import { createDpopProof } from "./dpop.js";
+import { environmentSecrets, safePayload } from "./secrets.js";
 import { endpointPath, publicEndpoint, type ValidatedEndpoint } from "./url.js";
 import {
   REQUIRED_SCOPES,
@@ -133,7 +134,9 @@ async function request(
   url: URL,
   init: RequestInit,
   errorCode: "descriptor" | "pairing" | "session" | "projects" | "thread" | "dispatch",
+  assertActive: () => void = () => undefined,
 ): Promise<Response> {
+  assertActive();
   let response: Response;
   try {
     response = await fetch(url, {
@@ -156,6 +159,7 @@ async function request(
     );
   }
 
+  assertActive();
   if (!response.ok) {
     if (errorCode === "pairing" && (response.status === 401 || response.status === 400)) {
       throw new ConnectorError("pairing_rejected", "The environment rejected the pairing grant.");
@@ -259,15 +263,18 @@ async function pairWithGrant(
   endpoint: ValidatedEndpoint,
   proofKey?: DpopPrivateJwk,
   expectedEnvironmentId?: string,
+  assertActive: () => void = () => undefined,
 ): Promise<PairingResult> {
   const descriptorResponse = await request(
     endpointPath(endpoint.baseUrl, "/.well-known/t3/environment"),
     { method: "GET" },
     "descriptor",
+    assertActive,
   );
   const descriptor = parseDescriptor(
     await json(descriptorResponse, "upstream_incompatible"),
   );
+  assertActive();
   const descriptorMetadata = JSON.stringify(descriptor);
   if ([endpoint.grant, proofKey?.d].filter((secret): secret is string => !!secret)
     .some((secret) => descriptorMetadata.includes(secret) || descriptorMetadata.includes(encodeURIComponent(secret)))) {
@@ -309,8 +316,10 @@ async function pairWithGrant(
       body,
     },
     "pairing",
+    assertActive,
   );
   const token = await json(tokenResponse, "pairing_rejected");
+  assertActive();
   if (
     !isRecord(token) ||
     !requiredString(token.access_token) ||
@@ -365,8 +374,10 @@ async function pairWithGrant(
         : { authorization: `Bearer ${token.access_token}` },
     },
     "session",
+    assertActive,
   );
   const session = await json(sessionResponse, "upstream_incompatible");
+  assertActive();
   const sessionExpiresAt = parseSession(session, accessTokenExpiresAt, tokenType);
 
   return {
@@ -387,8 +398,9 @@ export async function pairConnectEnvironment(
   endpoint: ValidatedEndpoint,
   proofKey: DpopPrivateJwk,
   expectedEnvironmentId: string,
+  assertActive: () => void,
 ): Promise<PairingResult> {
-  return pairWithGrant(endpoint, proofKey, expectedEnvironmentId);
+  return pairWithGrant(endpoint, proofKey, expectedEnvironmentId, assertActive);
 }
 
 function invalidOrchestration(message: string): never {
@@ -702,7 +714,7 @@ async function readProjectSnapshot(environment: PairedEnvironment): Promise<read
     { method: "GET", headers: await environmentHeaders(environment, "GET", url) },
     "projects",
   );
-  return parseProjects(await json(response, "upstream_incompatible"));
+  return safePayload(parseProjects(await json(response, "upstream_incompatible")), environmentSecrets(environment));
 }
 
 export async function listProjects(environment: PairedEnvironment): Promise<readonly PublicProject[]> {
@@ -740,7 +752,7 @@ export async function getThread(
     { method: "GET", headers: await environmentHeaders(environment, "GET", url) },
     "thread",
   );
-  return parseThread(await json(response, "upstream_incompatible"), environment.environmentId, threadId, turnLimit);
+  return safePayload(parseThread(await json(response, "upstream_incompatible"), environment.environmentId, threadId, turnLimit), environmentSecrets(environment));
 }
 
 export interface DispatchAcknowledgement {

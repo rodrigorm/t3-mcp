@@ -95,6 +95,17 @@ direct-registration attachment migration fix is covered below.
   path, each dispatch is sent once. Lost acknowledgements remain unknown; partial
   starts retain the created thread and command identifiers.
 
+Public project/thread snapshots and registration metadata reject reflection of retained
+environment session tokens or proof-key secrets, including either attached access path.
+Identifiers are rejected rather than redacted into a different target. Both MCP text and
+structured results receive the same sanitized error.
+
+Registration and attachment retain an account/lifecycle guard through relay exchange,
+credential brokering, each environment pairing boundary, and atomic persistence. Sign-out
+or a newer login invalidates retired work. Registration snapshots include absent entries
+and deletion revisions, so an initial exchange cannot resurrect an identity that another
+request added and unregistered. Changes to unrelated identities still commit independently.
+
 ## Fixture evidence and reuse
 
 `test/support/connect-http.js` provides reusable controlled HTTP infrastructure:
@@ -141,6 +152,12 @@ restart, sign-out access, independent unregistration/account retention, Connect-
 pairing, opaque-token rejection, approval/input stops, and unknown submissions without
 replay. A stale completed snapshot cannot claim continuation completion. Fixtures complete
 the browser callback through HTTP; they do not automate or authenticate a hosted browser.
+
+The attachment smoke proves stable attachment through public MCP before disabling direct
+fallback only in its freshly created temporary state. Its project/turn, restart, and
+sign-out checks then require the attached Connect session. The installed fixture verifies
+that Connect reads returning 503 cannot pass through a healthy direct session. Regular
+connector fallback is covered separately and retains its existing behavior.
 
 On 2026-09-30, unauthenticated production relay metadata returned HTTP 200 at both
 `/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource`.

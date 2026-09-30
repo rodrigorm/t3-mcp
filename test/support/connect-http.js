@@ -130,7 +130,7 @@ export async function startConnectControl(environments, options = {}) {
   });
   const endpoint = (environment) => ({ httpBaseUrl: environment.baseUrl,
     wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"), providerKind: "cloudflare_tunnel" });
-  const relay = await http((request, response, body) => {
+  const relay = await http(async (request, response, body) => {
     relayRequests.push({ method: request.method, path: request.url, headers: request.headers, body });
     if (state.outage) return json(response, { code: "unavailable", secret: state.accessToken }, 503);
     if (request.method === "GET" && request.url === "/v1/environments") {
@@ -139,6 +139,7 @@ export async function startConnectControl(environments, options = {}) {
         label: environment.label ?? environment.id, endpoint: endpoint(environment), linkedAt: "2026-09-20T00:00:00.000Z" })) });
     }
     if (request.method === "POST" && request.url === "/v1/client/dpop-token") {
+      await state.beforeRelayExchange?.();
       if (state.relayStatus) return json(response, { code: "auth_invalid", secret: state.accessToken }, state.relayStatus);
       const form = new URLSearchParams(body);
       assert.equal(form.get("grant_type"), EXCHANGE);
@@ -161,6 +162,7 @@ export async function startConnectControl(environments, options = {}) {
     }
     const match = request.url?.match(/^\/v1\/environments\/([^/]+)\/connect$/);
     if (request.method === "POST" && match) {
+      await state.beforeConnect?.();
       const token = request.headers.authorization?.replace(/^DPoP /, "");
       const jkt = relayTokens.get(token);
       assert.ok(jkt);
@@ -197,6 +199,7 @@ export async function startConnectEnvironment(id, options = {}) {
   const server = await http(async (request, response, body) => {
     requests.push({ method: request.method, path: request.url, headers: request.headers, body });
     if (request.method === "GET" && request.url === "/.well-known/t3/environment") {
+      await state.beforeDescriptor?.();
       return json(response, state.descriptor ?? { environmentId: state.descriptorId, label: state.label,
         platform: { os: "linux", arch: "x64" }, serverVersion: "0.0.42", orchestrationProtocolVersion: 1,
         capabilities: {}, ...state.descriptorOverrides });
@@ -231,6 +234,7 @@ export async function startConnectEnvironment(id, options = {}) {
     }
     if (session.jkt) verifyDpop(request, server.baseUrl, replay, { token, thumbprint: session.jkt });
     if (request.method === "GET" && request.url === "/api/auth/session") {
+      await state.beforeSession?.();
       return json(response, state.sessionResponse ?? { authenticated: true,
         auth: { policy: "loopback-browser", bootstrapMethods: ["one-time-token"],
           sessionMethods: [session.jkt ? "dpop-access-token" : "bearer-access-token"], sessionCookieName: "t3_session" },
@@ -242,16 +246,18 @@ export async function startConnectEnvironment(id, options = {}) {
       if (state.readStatus !== 200) return json(response, { code: "denied", secret: token }, state.readStatus);
       const url = new URL(request.url, server.baseUrl);
       if (url.pathname === "/api/orchestration/snapshot") {
-        return json(response, { snapshotSequence: commands.length, projects: [{ id: "project", title: state.label,
-          defaultModelSelection: { instanceId: "fixture", model: "model" } }], threads: [], updatedAt: new Date().toISOString() });
+        const snapshot = { snapshotSequence: commands.length, projects: [{ id: "project", title: state.label,
+          defaultModelSelection: { instanceId: "fixture", model: "model" } }], threads: [], updatedAt: new Date().toISOString() };
+        return json(response, state.projectSnapshot?.(snapshot, token) ?? snapshot);
       }
       if (url.pathname.startsWith("/api/orchestration/threads/")) {
         const id = decodeURIComponent(url.pathname.split("/").at(-1));
         const thread = threads.get(id);
         if (!thread) return json(response, { code: "thread_not_found" }, 404);
-        return json(response, { snapshotSequence: commands.length, thread: { ...thread,
+        const snapshot = { snapshotSequence: commands.length, thread: { ...thread,
           latestTurn: { state: state.threadState ?? "completed" }, session: { status: "ready" }, activities: state.activities ?? [] },
-        page: { beforeCursor: null, hasMore: false, snapshotSequence: commands.length } });
+        page: { beforeCursor: null, hasMore: false, snapshotSequence: commands.length } };
+        return json(response, state.threadSnapshot?.(snapshot, token) ?? snapshot);
       }
     }
     if (request.method === "POST" && request.url === "/api/orchestration/dispatch") {
