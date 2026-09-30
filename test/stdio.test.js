@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { startConnectControl, verifyDpop } from "./support/connect-http.js";
+import { operatorLogin, startConnectControl, verifyDpop } from "./support/connect-http.js";
 
 const connectorPath = path.join(process.cwd(), "dist", "index.js");
 
@@ -484,16 +484,10 @@ test("authenticates with Connect, discovers without registering, attaches, regis
     const started = await client.callTool({ name: "connect_authenticate", arguments: {} });
     const authorizationUrl = content(started).authentication.authorizationUrl;
     assert.equal(content(started).authentication.status, "pending");
-    const authorization = new URL(authorizationUrl);
-    const fragment = new URLSearchParams(authorization.hash.slice(1));
-    connect.authorize(fragment);
-    const callback = await fetch(
-      `http://127.0.0.1:${fragment.get("port")}/callback?state=${encodeURIComponent(fragment.get("state"))}&code=browser-code`,
-    );
-    assert.equal(callback.status, 200);
+    await operatorLogin(authorizationUrl);
     assert.equal(content(await client.callTool({ name: "connect_authenticate", arguments: { action: "status" } })).authentication.status, "authenticated");
-    assert.equal(connect.clerkRequests.length, 1);
-    assert.match(connect.clerkRequests[0].body, /code_verifier=/);
+    assert.equal(connect.clerkRequests[0].path, "/v1/client");
+    assert.ok(connect.clerkRequests.some((request) => request.path.endsWith("/tokens/t3-relay")));
 
     const discovered = await client.callTool({ name: "list_connect_environments", arguments: {} });
     assert.deepEqual(content(discovered).environments.map((environment) => environment.id), ["environment-a", "environment-b"]);

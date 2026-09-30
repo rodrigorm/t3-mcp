@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { startConnectControl, verifyDpop } from "./connect-http.js";
+import { operatorLogin, startConnectControl, verifyDpop } from "./connect-http.js";
 
 const controls = new WeakMap();
 
@@ -163,9 +163,6 @@ export async function connectControl(t, environments) {
 export async function login(client, env) {
   const authentication = success(await call(client, "connect_authenticate")).authentication;
   assert.equal(authentication.status, "pending");
-  const fragment = new URLSearchParams(new URL(authentication.authorizationUrl).hash.slice(1));
-  controls.get(env).authorize(fragment, "unregister-browser-code");
-  const callback = await fetch(`http://127.0.0.1:${fragment.get("port")}/callback?state=${encodeURIComponent(fragment.get("state"))}&code=unregister-browser-code`);
-  assert.equal(callback.status, 200);
+  await operatorLogin(authentication.authorizationUrl);
   assert.equal(success(await call(client, "connect_authenticate", { action: "status" })).authentication.status, "authenticated");
 }

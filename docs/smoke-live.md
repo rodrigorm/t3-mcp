@@ -57,21 +57,22 @@ The sequence is `add_environment`, exact identity check, `list_environments`, `l
 
 ## Connect smoke
 
-The live run is currently blocked. Hosted OAuth tokens cannot satisfy the relay's JWT-only
-registration exchange without a verified upstream authorization handoff. See
-[the contract and blocker](connect-registration-contract.md). Login/discovery success,
-public metadata availability, and fixture success do not satisfy the live gate.
+The connector now implements Desktop-native Clerk login and session-template renewal through
+the public Frontend API. The remaining real smoke needs an operator and authorized remote
+resources. See [the auth contract](connect-auth-contract.md). Public metadata availability
+and controlled fixture success do not establish a live authenticated pass.
 
 Before running, provide all of these:
 
-- An upstream-owned public-client authorization contract that privately delivers and renews
-  the relay-compatible subject, or deliberately supports OAuth subjects. The pinned and
-  inspected current upstream do not provide this handoff. A different client ID or re-login
-  does not repair an opaque token.
-- An explicitly authorized Connect account, matching hosted-page OAuth client and token
-  endpoint, and an accepted loopback callback URI on the connector host. The browser must
-  reach that host's callback. Port 34338 is the upstream default; another port requires the
-  OAuth application's redirect policy to allow it.
+- An existing operator-authorized T3 account with an offered email-code or password first
+  factor. The operator needs the mailbox/password and any offered authenticator, backup,
+  SMS or email second-factor/client-trust code. This minimal UI reports unsupported
+  social/SSO, passkey, reset, sign-up, task and challenge steps instead of bypassing them.
+- A browser on the connector host that can reach its loopback UI. The listener uses an
+  OS-assigned port by default. This is a connector-owned local page, not a Clerk OAuth
+  callback, so no new redirect allowlist or Desktop scheme takeover is needed.
+- Normal access to Clerk, the relay and the selected machines, a reasonably synchronized
+  clock for DPoP, and permission to store the connector's owned login in private local state.
 - Two explicitly selected, distinct, ready managed `cloudflare_tunnel` environments.
   `T3_MCP_ENVIRONMENT_ID` is the turn target. `T3_MCP_SANITY_CONNECT_ENVIRONMENT_ID` is
   a separate registration used to verify that unregistration leaves other access working.
@@ -79,11 +80,12 @@ Before running, provide all of these:
 - A disposable project and usable model on the turn target. To verify attachment, also
   supply a fresh direct pairing grant for exactly that target identity.
 
-Configure `T3_MCP_CONNECT_RELAY_URL`, `T3_MCP_CONNECT_CLIENT_ID`, and
-`T3_MCP_CONNECT_TOKEN_ENDPOINT` or `T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY` from the verified
-deployment. Set `T3_MCP_CONNECT_HOSTED_APP_URL` if its hosted page differs from the package's
-public default. Keep grants, callback exchanges, tokens, and private keys outside logs,
-shell history, issue text, and committed files.
+The public Desktop configuration is the default: key `pk_live_Y2xlcmsudDMuY29kZXMk`,
+template `t3-relay` and relay `https://relay.t3.codes`. For another deployment, configure
+`T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY`, `T3_MCP_CONNECT_CLERK_JWT_TEMPLATE`,
+`T3_MCP_CONNECT_FRONTEND_API_URL` and `T3_MCP_CONNECT_RELAY_URL` as needed.
+CLI client ID/token endpoint/hosted `/connect` configuration is unnecessary. Enter identifiers,
+passwords and codes only in the local browser form, never in MCP arguments or shell commands.
 
 Run registration and attachment as separate checks with fresh smoke state:
 
@@ -109,15 +111,18 @@ Normal connector access selection and fallback remain available outside this iso
 
 The Connect runner performs:
 
-1. `connect_authenticate`, print the public PKCE authorization URL, and poll `action=status`.
-   Open the URL and complete browser login. The runner does not export or borrow credentials.
+1. `connect_authenticate`, print the local authorization URL, and poll `action=status`.
+   Open `http://127.0.0.1:<port>/login#<capability>` in a browser on the connector host.
+   Enter the account identifier, choose an offered factor, and complete all requested codes.
+   Node verifies its own Client API session and template JWT through relay discovery.
 2. `list_connect_environments` and confirm that discovery leaves saved registrations unchanged.
 3. Explicit registration or stable attachment of the turn target, then explicit registration of
    the operator-selected sanity environment. Confirm the exact saved registration set.
 4. Project/start/read/continue/read on the chosen project and same thread. Acknowledgement
    alone is insufficient. Wait for the submitted message, a subsequent non-streaming assistant
    response, the acknowledged snapshot sequence, and completed status.
-5. Restart the installed connector with the same smoke state and check saved project/thread access.
+5. Restart the installed connector with the same smoke state and check owned native login,
+   renewal/discovery and saved project/thread access.
 6. `sign_out_connect`, confirm signed-out status and discovery rejection, then verify unchanged
    registrations and valid project/thread access, including the sanity registration.
 7. Authenticate again through a second explicit browser login. This permits an independent
@@ -151,11 +156,11 @@ safe summary codes, and exit status separately from credentials. The current evi
 | Attachment runner with Connect reads returning 503 and healthy direct access | Stops with `transport_error`; no completion claim or direct dispatch |
 | Public relay authorization-server and protected-resource metadata | Unauthenticated HTTP 200; exact relay resource/token endpoint and ES256/DPoP declarations match |
 | Real direct workflow | Not run in this process; no authorized endpoint/grant/project supplied |
-| Real Connect registration and attachment workflows | Blocked before live execution; authorization handoff and operator resources unavailable |
+| Real Desktop login, template renewal, Connect registration and attachment | Not run; operator credentials and authorized resources were not supplied |
 
-Upstream pin is `7445aa733ada33e45289e5aa5055f79142556513`. The earlier inspected current
-target is `c2fa9fc911daeac97df4760f95fc57dca42b84c8`; `main` resolved to
-`35be904f2fc40aa6d7a42778b6895e8274f3097f` during #16 verification. The relay token exchange
-handler and hosted authorize builder are identical at all three targets. This source/metadata
-inspection is not a live authentication or turn pass. #15's local attachment fixes are implemented;
-#16 and the supported-Connect gate remain incomplete.
+Source baselines are T3 `d5980a0ff1511e6ae1f1876406a7c45a7a989cdb` and
+`7445aa733ada33e45289e5aa5055f79142556513`, Clerk JavaScript
+`ee1f90a65603db0673dbb0055c89ee820c4a64fa`, and public OpenAPI
+`cdd59c4139088a7f733e7fdf2aa73eb74877d967`, FAPI version `2026-05-12`.
+These sources establish the public implementation contract. They do not establish a
+production-authenticated smoke pass. The earlier upstream JWT-handoff prerequisite was incorrect.

@@ -8,7 +8,7 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { call, failure, login, startConnectControl, startConnectEnvironment, success } from "./support/connect-http.js";
+import { call, failure, login, operatorLogin, startConnectControl, startConnectEnvironment, success } from "./support/connect-http.js";
 
 const run = promisify(execFile);
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
@@ -259,7 +259,7 @@ test("runs the packed package through explicit Connect registration, attachment 
       }
     });
 
-    await t.test("runner reports the opaque OAuth registration blocker without attempting relay exchange", async () => {
+    await t.test("runner rejects a malformed Clerk template before relay exchange", async () => {
       const original = control.state.accessToken;
       const exchanges = control.relayRequests.filter((request) => request.path === "/v1/client/dpop-token").length;
       control.state.accessToken = "opaque-fixture-subject";
@@ -316,9 +316,7 @@ test("runs the packed package through explicit Connect registration, attachment 
         buffer = lines.pop();
         for (const line of lines) {
           if (!line.startsWith("authorization_url=")) continue;
-          const fragment = new URLSearchParams(new URL(line.slice("authorization_url=".length)).hash.slice(1));
-          control.authorize(fragment);
-          callbacks.push(fetch(`http://127.0.0.1:${fragment.get("port")}/callback?state=${encodeURIComponent(fragment.get("state"))}&code=browser-code`));
+          callbacks.push(operatorLogin(line.slice("authorization_url=".length)).catch(() => undefined));
         }
       });
       child.stderr.on("data", (chunk) => { output += chunk; });
@@ -326,11 +324,11 @@ test("runs the packed package through explicit Connect registration, attachment 
       const code = await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
       clearTimeout(timer);
       await Promise.all(callbacks);
-      for (const secret of [control.state.accessToken, "fixture-refresh", "direct-grant", ...remote.sessions.keys(), ...attached.sessions.keys()]) {
+      for (const secret of [control.state.accessToken, control.state.nativeClientToken, "direct-grant", ...remote.sessions.keys(), ...attached.sessions.keys()]) {
         assert.equal(output.includes(secret), false, "runner output must exclude credentials");
       }
       for (const line of output.trim().split("\n")) {
-        assert.ok(/^(authorization_url=https:\/\/|[a-z_]+ outcome=accepted$|smoke_complete=true$|smoke_stopped reason=[a-z0-9_]+$)/.test(line), "runner must print only public authorization URLs and safe summary codes");
+        assert.ok(/^(authorization_url=http:\/\/127\.0\.0\.1:|[a-z_]+ outcome=accepted$|smoke_complete=true$|smoke_stopped reason=[a-z0-9_]+$)/.test(line), "runner must print only local authorization URLs and safe summary codes");
       }
       return { code, output };
     }

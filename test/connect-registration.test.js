@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { call, content, failure, fixture, login, relaySubjectJwt, startConnectEnvironment, success } from "./support/connect-http.js";
+import { call, content, failure, fixture, login, operatorPost, relaySubjectJwt, startConnectEnvironment, success } from "./support/connect-http.js";
 
-test("reports incompatible OAuth subjects without requesting a relay session or exposing credentials", async (t) => {
-  for (const accessToken of ["opaque-oauth-secret", relaySubjectJwt("oauth-client")]) {
+test("rejects malformed or wrong-audience Clerk template subjects before authenticating or requesting a relay session", async (t) => {
+  for (const accessToken of ["opaque-template-secret", relaySubjectJwt("wrong-audience")]) {
     const f = await fixture(t, [{ id: "remote", baseUrl: "http://127.0.0.1:1" }], { accessToken });
     const { client, stderr } = await f.client();
-    await login(client, f.control);
-    assert.equal(success(await call(client, "list_connect_environments")).environments.length, 1);
-    const result = await call(client, "register_connect_environment", { environmentId: "remote" });
-    failure(result, "upstream_incompatible");
-    assert.match(content(result).error.message, /relay.*JWT|JWT.*relay/);
-    assert.match(content(result).error.message, /direct pairing/i);
+    const auth = success(await call(client, "connect_authenticate")).authentication;
+    await operatorPost(auth.authorizationUrl, "identify", { identifier: "operator@example.test" });
+    const response = await operatorPost(auth.authorizationUrl, "verify", { code: "123456" });
+    assert.equal(response.status, 400);
+    const result = await call(client, "connect_authenticate", { action: "status" });
+    assert.equal(content(result).authentication.status, "failed");
+    assert.equal(content(result).authentication.error.code, "upstream_incompatible");
     assert.equal(JSON.stringify(result).includes(accessToken), false);
     assert.equal(stderr().includes(accessToken), false);
     assert.deepEqual(success(await call(client, "list_environments")).environments, []);
@@ -40,17 +41,21 @@ test("rejects reflected bootstrap credentials in environment metadata without em
   assert.deepEqual(success(await call(client, "list_environments")).environments, []);
 });
 
-test("keeps environment sessions usable after OAuth expiry and keeps equal project/thread identifiers isolated", async (t) => {
+test("keeps environment sessions usable after Clerk session revocation and keeps equal project/thread identifiers isolated", async (t) => {
   const alpha = await startConnectEnvironment("alpha", { label: "Same label" });
   const beta = await startConnectEnvironment("beta", { label: "Same label" });
-  const f = await fixture(t, [alpha, beta], { expiresIn: 1, refresh: false });
+  const f = await fixture(t, [alpha, beta]);
   const { client } = await f.client();
   await login(client, f.control);
   for (const environmentId of ["alpha", "beta"]) success(await call(client, "register_connect_environment", { environmentId }));
   const snapshot = (text) => ({ id: "same-thread", projectId: "project", title: text, messages: [] });
   alpha.threads.set("same-thread", snapshot("Alpha thread"));
   beta.threads.set("same-thread", snapshot("Beta thread"));
-  await new Promise((resolve) => setTimeout(resolve, 1050));
+  const file = path.join(f.directory, "connect.json");
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  saved.auth.expiresAt = new Date(0).toISOString();
+  await writeFile(file, JSON.stringify(saved));
+  f.control.state.sessionStatus = "revoked";
   failure(await call(client, "list_connect_environments"), "connect_auth_expired");
   const relayCount = f.control.relayRequests.length;
   assert.equal(success(await call(client, "get_thread", { environmentId: "alpha", threadId: "same-thread" })).thread.title, "Alpha thread");
@@ -59,8 +64,9 @@ test("keeps environment sessions usable after OAuth expiry and keeps equal proje
   assert.equal(alpha.commands.length, 0);
   assert.equal(beta.commands.length, 1);
   assert.equal(f.control.relayRequests.length, relayCount);
-  assert.equal(f.control.clerkRequests.length, 1);
+  const clerkCount = f.control.clerkRequests.length;
   assert.deepEqual(success(await call(client, "list_environments")).environments.map((entry) => entry.id), ["alpha", "beta"]);
+  assert.equal(f.control.clerkRequests.length, clerkCount);
 });
 
 test("Connect mutations retain partial/unknown identifiers and never switch to another access path after preflight", async (t) => {
@@ -226,7 +232,7 @@ test("uses retained direct access when an unexpired preferred Connect path is un
   }
 });
 
-test("rejects malformed relay exchanges and reports rejected JWT/proof compatibility rather than expired OAuth login", async (t) => {
+test("rejects malformed relay exchanges and reports rejected JWT/proof compatibility separately from Clerk login expiry", async (t) => {
   const remote = await startConnectEnvironment("remote");
   const f = await fixture(t, [remote]);
   const { client } = await f.client();

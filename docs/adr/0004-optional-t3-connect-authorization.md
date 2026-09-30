@@ -4,7 +4,7 @@ T3 Connect is an optional operator-driven authorization path layered beside dire
 
 ## Consequences
 
-Connect authentication uses browser OAuth with PKCE through a loopback callback. Connect credentials and the DPoP private key are stored in a separate owner-only state file from environment registrations. Relay and environment access tokens are never returned in MCP results or diagnostics.
+Corrected on 2026-09-30: Connect authentication reproduces Desktop's public native Clerk Client API lifecycle. Node owns a new client/session and mints the `t3-relay` template JWT; the operator enters existing-account factors in a connector-owned loopback page. This avoids an ongoing browser profile dependency and installed Desktop callback conflicts. Connect credentials and the DPoP private key remain in separate owner-only atomic state from environment registrations.
 
 Direct pairing remains usable without Connect. A saved environment may retain both direct and Connect access paths; sign-out clears only Connect authentication, while unregistration removes the saved environment and all stored access paths.
 
@@ -12,4 +12,4 @@ Connect environment access uses DPoP proofs and validates the selected environme
 
 ## Evidence and further notes
 
-The upstream `pingdotgg/t3code` commit `7445aa733ada33e45289e5aa5055f79142556513`, inspected on 2026-09-20, documents the Connect OAuth, relay, DPoP, and environment-authentication boundaries. The automated fixture covers the public MCP lifecycle; live Connect verification still requires an operator-authorized account and environment.
+The Desktop auth contract agrees at T3 revisions `d5980a0ff1511e6ae1f1876406a7c45a7a989cdb` and `7445aa733ada33e45289e5aa5055f79142556513`. Clerk's public native/session-template APIs supply the required relay subject; the earlier upstream-handoff blocker claim was incorrect. Exact immutable Clerk/OpenAPI sources and supported-factor limits are in [the auth contract](../connect-auth-contract.md). Live verification still needs operator-authorized login and environments.

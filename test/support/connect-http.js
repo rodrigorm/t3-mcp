@@ -20,10 +20,10 @@ function jwt(header, claims) {
   return `${input}.${sign(null, Buffer.from(input), relayKey.privateKey).toString("base64url")}`;
 }
 
-// Controlled OAuth issuer can supply this subject. Hosted T3 OAuth has no verified such handoff.
-export function relaySubjectJwt(audience = "t3-code-relay", subject = "connect-account-a") {
+// Controlled Clerk session-template issuer. The relay verifies its signature independently.
+export function relaySubjectJwt(audience = "t3-code-relay", subject = "connect-account-a", lifetime = 3600, extraClaims = {}) {
   const now = Math.floor(Date.now() / 1000);
-  const input = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iss: "https://fixture.clerk.test", sub: subject, aud: audience, iat: now, exp: now + 3600 })}`;
+  const input = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iss: "https://fixture.clerk.test", sub: subject, aud: audience, iat: now, exp: now + lifetime, ...extraClaims })}`;
   return `${input}.${sign("sha256", Buffer.from(input), clerkKey.privateKey).toString("base64url")}`;
 }
 
@@ -63,7 +63,7 @@ export function verifyDpop(request, origin, replay, { token, thumbprint } = {}) 
   url.search = "";
   url.hash = "";
   assert.equal(claims.htu, url.toString());
-  assert.equal(claims.htm.toUpperCase(), request.method);
+  assert.equal(claims.htm, request.method);
   assert.equal(typeof claims.jti, "string");
   assert.ok(claims.jti.trim());
   assert.ok(Number.isInteger(claims.iat));
@@ -84,7 +84,9 @@ export function json(response, value, status = 200) {
 }
 
 export async function http(handler) {
-  const server = createServer(async (request, response) => {
+  // Permit the signed large-template storage-race fixture. Proof/credential checks
+  // below remain strict; production services keep their own HTTP size limits.
+  const server = createServer({ maxHeaderSize: 32 * 1024 * 1024 }, async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     try {
@@ -101,32 +103,82 @@ export async function http(handler) {
 }
 
 export async function startConnectControl(environments, options = {}) {
-  const state = { accessToken: relaySubjectJwt(), expiresIn: 3600, refresh: true, ...options };
+  const state = { accessToken: relaySubjectJwt(), ...options };
   const clerkRequests = [];
   const relayRequests = [];
   const replay = new Set();
   const relayTokens = new Map();
-  const codes = new Map();
-  const clerk = await http((request, response, body) => {
-    clerkRequests.push({ method: request.method, path: request.url, body });
+  const clients = new Map();
+  let clientCount = 0;
+  let rotation = 0;
+  const session = (owner) => ({ id: owner.sessionId, status: state.sessionStatus ?? "active",
+    expire_at: state.sessionExpiresAt ?? Date.now() + 3600_000, user: { id: state.accountId ?? "connect-account-a" },
+    tasks: state.tasks ?? [] });
+  const client = (owner) => ({ id: owner.id, sessions: owner.authenticated ? [session(owner)] : [], last_active_session_id: owner.authenticated ? owner.sessionId : null });
+  const attempt = (owner, status) => ({ id: "si_owned", status,
+    supported_first_factors: state.firstFactors ?? [{ strategy: "email_code", email_address_id: "email_owned" }, { strategy: "password" }],
+    supported_second_factors: state.secondFactors ?? [{ strategy: "totp" }],
+    created_session_id: status === "complete" ? owner.sessionId : null,
+    ...(state.protectCheck ? { protect_check: state.protectCheck } : {}) });
+  const clerk = await http(async (request, response, body) => {
+    const url = new URL(request.url, "http://fixture");
+    clerkRequests.push({ method: request.method, path: url.pathname, query: url.searchParams, headers: request.headers, body });
     const form = new URLSearchParams(body);
-    assert.equal(request.method, "POST");
-    assert.equal(request.url, "/oauth/token");
-    assert.equal(form.get("client_id"), "fixture-client");
-    if (form.get("grant_type") === "authorization_code") {
-      const authorized = codes.get(form.get("code"));
-      assert.ok(authorized);
-      codes.delete(form.get("code"));
-      assert.equal(hash(form.get("code_verifier")), authorized.challenge);
-      assert.equal(form.get("redirect_uri"), authorized.redirect);
+    assert.equal(url.searchParams.get("_is_native"), "1");
+    assert.equal(url.searchParams.get("__clerk_api_version"), "2026-05-12");
+    assert.equal(request.headers.origin, undefined);
+    assert.equal(request.headers.cookie, undefined);
+    let owner;
+    if (url.pathname === "/v1/client" && request.method === "POST") {
+      const n = ++clientCount;
+      owner = { id: `client_owned_${n}`, sessionId: n === 1 ? "sess_owned" : `sess_owned_${n}`, authenticated: false };
     } else {
-      assert.equal(form.get("grant_type"), "refresh_token");
-      assert.equal(form.get("refresh_token"), "fixture-refresh");
-      if (!state.refresh) return json(response, { error: "invalid_grant" }, 400);
+      const previous = request.headers.authorization?.replace(/^Bearer /, "");
+      owner = clients.get(previous);
+      assert.ok(owner);
+      clients.delete(previous);
     }
-    return json(response, { access_token: state.accessToken, token_type: "Bearer", expires_in: state.expiresIn,
-      ...(state.refresh ? { refresh_token: "fixture-refresh" } : {}),
-      id_token: relaySubjectJwt("fixture-client") });
+    const credential = `native-client-secret-${++rotation}`;
+    clients.set(credential, owner);
+    state.nativeClientToken = credential;
+    response.setHeader("authorization", rotation % 2 ? `Bearer ${credential}` : credential);
+    await state.beforeClerk?.(url.pathname, request.method);
+    if (state.clerkStatus) return json(response, { errors: [{ code: "session_not_found", message: credential }] }, state.clerkStatus);
+    const reply = (value) => json(response, { response: value, client: client(owner) });
+    if (url.pathname === "/v1/client") return reply(state.clientResponse ?? client(owner));
+    if (url.pathname === "/v1/client/sign_ins") {
+      assert.equal(form.get("identifier"), "operator@example.test");
+      return reply(attempt(owner, state.signInStatus ?? "needs_first_factor"));
+    }
+    if (url.pathname.endsWith("/prepare_first_factor")) {
+      assert.equal(form.get("strategy"), "email_code");
+      assert.equal(form.get("email_address_id"), "email_owned");
+      return reply(attempt(owner, "needs_first_factor"));
+    }
+    if (url.pathname.endsWith("/attempt_first_factor")) {
+      if (state.rejectVerify) return json(response, { errors: [{ code: "form_code_incorrect", message: credential,
+        long_message: "operator-password reflected" }] }, 422);
+      assert.ok(form.get("code") === "123456" || form.get("password") === "operator-password");
+      const status = state.afterFirstFactor ?? "complete";
+      owner.authenticated = status === "complete";
+      return reply(attempt(owner, status));
+    }
+    if (url.pathname.endsWith("/prepare_second_factor")) return reply(attempt(owner, state.afterFirstFactor));
+    if (url.pathname.endsWith("/attempt_second_factor")) {
+      assert.equal(form.get("code"), "654321");
+      owner.authenticated = true;
+      return reply(attempt(owner, "complete"));
+    }
+    if (url.pathname.endsWith("/end")) { owner.authenticated = false; return reply({ ...session(owner), status: "ended" }); }
+    if (url.pathname.endsWith("/tokens/t3-relay")) {
+      assert.ok(owner.authenticated);
+      assert.equal(body, "");
+      if (state.templateLifetime) state.accessToken = relaySubjectJwt("t3-code-relay", state.accountId ?? "connect-account-a", state.templateLifetime);
+      // Template tokens are a direct { jwt } response in the public OpenAPI.
+      return json(response, Object.hasOwn(state, "templateResponse") ? state.templateResponse : { jwt: state.accessToken });
+    }
+    if (url.pathname.startsWith(`/v1/client/sessions/${owner.sessionId}`)) { assert.ok(owner.authenticated); return reply(state.sessionResponse ?? session(owner)); }
+    return json(response, {}, 404);
   });
   const endpoint = (environment) => ({ httpBaseUrl: environment.baseUrl,
     wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"), providerKind: "cloudflare_tunnel" });
@@ -134,9 +186,12 @@ export async function startConnectControl(environments, options = {}) {
     relayRequests.push({ method: request.method, path: request.url, headers: request.headers, body });
     if (state.outage) return json(response, { code: "unavailable", secret: state.accessToken }, 503);
     if (request.method === "GET" && request.url === "/v1/environments") {
+      await state.beforeDiscovery?.();
       assert.equal(request.headers.authorization, `Bearer ${state.accessToken}`);
-      return json(response, { environments: environments.map((environment) => ({ environmentId: environment.id,
-        label: environment.label ?? environment.id, endpoint: endpoint(environment), linkedAt: "2026-09-20T00:00:00.000Z" })) });
+      const identity = verifyJwt(state.accessToken);
+      assert.ok([identity.aud].flat().includes("t3-code-relay"));
+      return json(response, { environments: state.environments ?? environments.map((environment) => ({ environmentId: environment.id,
+        label: environment.label ?? environment.id, endpoint: endpoint(environment), linkedAt: "2026-09-20T00:00:00.000Z" })) }, state.discoveryStatus ?? 200);
     }
     if (request.method === "POST" && request.url === "/v1/client/dpop-token") {
       await state.beforeRelayExchange?.();
@@ -180,10 +235,8 @@ export async function startConnectControl(environments, options = {}) {
     }
     json(response, { code: "not_found" }, 404);
   });
-  return { state, clerkRequests, relayRequests, authorize(fragment, code = "browser-code") {
-    codes.set(code, { challenge: fragment.get("challenge"), redirect: `http://127.0.0.1:${fragment.get("port")}/callback` });
-  }, env: { T3_MCP_CONNECT_RELAY_URL: relay.baseUrl, T3_MCP_CONNECT_TOKEN_ENDPOINT: `${clerk.baseUrl}/oauth/token`,
-    T3_MCP_CONNECT_CLIENT_ID: "fixture-client", T3_MCP_CONNECT_HOSTED_APP_URL: "https://app.t3.codes",
+  return { state, clerkRequests, relayRequests,
+    env: { T3_MCP_CONNECT_RELAY_URL: relay.baseUrl, T3_MCP_CONNECT_FRONTEND_API_URL: clerk.baseUrl,
     T3_MCP_CONNECT_CALLBACK_PORT: "0" },
   close: async () => { await clerk.close(); await relay.close(); } };
 }
@@ -307,11 +360,21 @@ export function failure(result, code) {
 export async function login(client, control) {
   const auth = success(await call(client, "connect_authenticate")).authentication;
   assert.equal(auth.status, "pending");
-  const fragment = new URLSearchParams(new URL(auth.authorizationUrl).hash.slice(1));
-  control.authorize(fragment);
-  const response = await fetch(`http://127.0.0.1:${fragment.get("port")}/callback?state=${encodeURIComponent(fragment.get("state"))}&code=browser-code`);
-  assert.equal(response.status, 200);
+  await operatorLogin(auth.authorizationUrl);
   assert.equal(success(await call(client, "connect_authenticate", { action: "status" })).authentication.status, "authenticated");
+}
+
+export async function operatorPost(authorizationUrl, action, fields = {}, headers = {}) {
+  const url = new URL(authorizationUrl);
+  return fetch(`${url.origin}/login`, { method: "POST", headers: { origin: url.origin,
+    "content-type": "application/x-www-form-urlencoded", ...headers },
+    body: new URLSearchParams({ capability: url.hash.slice(1), action, ...fields }) });
+}
+export async function operatorLogin(url) {
+  assert.equal((await operatorPost(url, "identify", { identifier: "operator@example.test" })).status, 200);
+  const response = await operatorPost(url, "verify", { code: "123456" });
+  assert.equal(response.status, 200);
+  return response;
 }
 
 export async function fixture(t, environments = [], options = {}) {
