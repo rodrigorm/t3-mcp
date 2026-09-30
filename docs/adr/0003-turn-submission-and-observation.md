@@ -1,5 +1,7 @@
 # Separate turn submission from observation
 
+Status: Draft, reopened for the design interview. The statements below are proposals pending confirmation.
+
 `start_turn` creates a thread in an explicitly selected environment and project and submits its first turn; `continue_turn` submits a new turn to an explicitly selected existing thread. Both return after command acknowledgement rather than waiting for agent completion, and `get_thread` observes subsequent progress, because agent execution can outlive an MCP request.
 
 ## Consequences
