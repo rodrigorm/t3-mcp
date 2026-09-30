@@ -11,6 +11,8 @@
     "dist",
     "skills",
     "docs/compatibility.md",
+    "docs/connect-auth-contract.md",
+    "docs/connect-registration-contract.md",
     "README.md",
     "LICENSE"
   ],

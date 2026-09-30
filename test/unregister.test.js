@@ -133,7 +133,7 @@ test("unregistration removes a registration with both access paths while preserv
   const { client } = await f.client(env);
   success(await add(client, a));
   success(await add(client, b));
-  await login(client);
+  await login(client, env);
   assert.equal(success(await call(client, "attach_connect_environment", {
     environmentId: "a", targetEnvironmentId: "a",
   })).environment.connectAttached, true);
@@ -155,7 +155,7 @@ test("attachment preserves an unrelated removal and addition while its exchange 
   const { client } = await f.client(env);
   success(await add(client, a));
   success(await add(client, b));
-  await login(client);
+  await login(client, env);
   const pause = f.pause(a, "connect-a");
   const attachment = call(client, "attach_connect_environment", { environmentId: "a", targetEnvironmentId: "a" });
   await pause.entered;
@@ -182,7 +182,7 @@ for (const operation of ["attachment", "re-pair"]) {
       const env = operation === "attachment" ? await connectControl(t, f.environments) : {};
       const { client, stderr } = await f.client(env);
       success(await add(client, a));
-      if (operation === "attachment") await login(client);
+      if (operation === "attachment") await login(client, env);
       const grant = operation === "attachment" ? "connect-a" : "stale-repair";
       const pause = f.pause(a, grant);
       const pending = operation === "attachment"
@@ -227,7 +227,7 @@ test("a concurrent Connect registration cannot overwrite a new direct registrati
   const [a] = f.environments;
   const env = await connectControl(t, f.environments);
   const { client } = await f.client(env);
-  await login(client);
+  await login(client, env);
   const pause = f.pause(a, "connect-a");
   const registration = call(client, "register_connect_environment", { environmentId: "a" });
   await pause.entered;
@@ -295,7 +295,7 @@ test("parallel direct and Connect registrations retain independent additions and
   const env = await connectControl(t, f.environments);
   const { client } = await f.client(env);
   success(await add(client, d));
-  await login(client);
+  await login(client, env);
   const pauses = [f.pause(a, "connect-a"), f.pause(b, "connect-b"), f.pause(c, "direct")];
   const registrations = [call(client, "register_connect_environment", { environmentId: "a" }),
     call(client, "register_connect_environment", { environmentId: "b" }), add(client, c)];
@@ -323,7 +323,7 @@ test("unregistration wins over an in-flight Connect attachment without signing o
   const { client } = await f.client(env);
   success(await add(client, a));
   success(await add(client, b));
-  await login(client);
+  await login(client, env);
   const pause = f.pause(a, "connect-a");
   const attachment = call(client, "attach_connect_environment", { environmentId: "a", targetEnvironmentId: "a" });
   await pause.entered;

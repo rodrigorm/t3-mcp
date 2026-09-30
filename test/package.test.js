@@ -8,17 +8,21 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { call, login, startConnectControl, startConnectEnvironment, success } from "./support/connect-http.js";
 
 const run = promisify(execFile);
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 
-test("runs the packed package through the public MCP seam", { timeout: 120_000 }, async () => {
+test("runs the packed package through the public MCP seam and controlled Connect turn workflow", { timeout: 120_000 }, async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-package-"));
   const packDirectory = path.join(temporaryDirectory, "pack");
   const installDirectory = path.join(temporaryDirectory, "install");
   const stateDirectory = path.join(temporaryDirectory, "state");
   const packageRoot = path.join(installDirectory, "node_modules", "t3-mcp");
   let client;
+  const remote = await startConnectEnvironment("installed-remote");
+  const control = await startConnectControl([remote]);
+  t.after(async () => { await control.close(); await remote.close(); });
 
   try {
     await mkdir(packDirectory);
@@ -36,6 +40,8 @@ test("runs the packed package through the public MCP seam", { timeout: 120_000 }
       ["skills/t3-run-turn/SKILL.md"],
     );
     assert.ok(packedFiles.includes("docs/compatibility.md"));
+    assert.ok(packedFiles.includes("docs/connect-auth-contract.md"));
+    assert.ok(packedFiles.includes("docs/connect-registration-contract.md"));
 
     await run(
       npm,
@@ -74,7 +80,7 @@ test("runs the packed package through the public MCP seam", { timeout: 120_000 }
       command: process.execPath,
       args: [path.join(packageRoot, "dist", "index.js")],
       cwd: installDirectory,
-      env: { ...process.env, T3_MCP_STATE_DIR: stateDirectory, NODE_NO_WARNINGS: "1" },
+      env: { ...process.env, ...control.env, T3_MCP_STATE_DIR: stateDirectory, NODE_NO_WARNINGS: "1" },
       stderr: "ignore",
     });
     client = new Client({ name: "installed-package-test", version: "1.0.0" });
@@ -110,6 +116,16 @@ test("runs the packed package through the public MCP seam", { timeout: 120_000 }
     assert.deepEqual(environments.structuredContent ?? JSON.parse(environments.content[0].text), {
       environments: [],
     });
+    await login(client, control);
+    success(await call(client, "register_connect_environment", { environmentId: "installed-remote" }));
+    assert.deepEqual(success(await call(client, "list_projects", { environmentId: "installed-remote" })).projects,
+      [{ id: "project", name: "installed-remote" }]);
+    const start = success(await call(client, "start_turn", { environmentId: "installed-remote", projectId: "project", prompt: "first" })).start;
+    assert.equal(start.outcome, "acknowledged");
+    assert.equal(success(await call(client, "get_thread", { environmentId: "installed-remote", threadId: start.threadId })).thread.status, "completed");
+    const continuation = success(await call(client, "continue_turn", { environmentId: "installed-remote", threadId: start.threadId, prompt: "second" })).continuation;
+    assert.equal(continuation.outcome, "acknowledged");
+    assert.equal(success(await call(client, "get_thread", { environmentId: "installed-remote", threadId: start.threadId })).thread.messages.at(-1).text, "result 2");
   } finally {
     if (client) await client.close().catch(() => undefined);
     await rm(temporaryDirectory, { recursive: true, force: true });

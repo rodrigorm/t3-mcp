@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { startConnectControl, verifyDpop } from "./connect-http.js";
+
+const controls = new WeakMap();
 
 export function gate() {
   let enter;
@@ -40,6 +43,8 @@ export async function environment(id) {
   const requests = [];
   const pauses = new Map();
   const tokens = new Map();
+  const bindings = new Map();
+  const replay = new Set();
   const server = await http(async (request, response, body) => {
     requests.push({ path: request.url, authorization: request.headers.authorization });
     if (request.url === "/.well-known/t3/environment") {
@@ -53,8 +58,16 @@ export async function environment(id) {
       const grant = new URLSearchParams(body).get("subject_token");
       await pauses.get(grant)?.wait();
       const tokenType = grant.startsWith("connect-") ? "DPoP" : "Bearer";
+      if (tokenType === "DPoP") {
+        assert.ok(bindings.has(grant));
+        verifyDpop(request, server.baseUrl, replay, { thumbprint: bindings.get(grant) });
+      }
       const token = `session-${id}-${grant}`;
       tokens.set(token, tokenType);
+      if (tokenType === "DPoP") {
+        bindings.set(token, bindings.get(grant));
+        bindings.delete(grant);
+      }
       return json(response, {
         access_token: token, token_type: tokenType,
         issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
@@ -65,6 +78,7 @@ export async function environment(id) {
     if (!tokens.has(token) || tokens.get(token) !== type || (type === "DPoP" && !request.headers.dpop)) {
       return json(response, { error: "unauthorized" }, 401);
     }
+    if (type === "DPoP") verifyDpop(request, server.baseUrl, replay, { token, thumbprint: bindings.get(token) });
     if (request.url === "/api/auth/session") {
       return json(response, {
         authenticated: true,
@@ -81,7 +95,7 @@ export async function environment(id) {
     }
     json(response, { error: "not_found" }, 404);
   });
-  return { ...server, id, requests, pauses, tokens };
+  return { ...server, id, requests, pauses, tokens, bindBootstrap: (grant, jkt) => bindings.set(grant, jkt) };
 }
 
 export async function fixture(t, ids = ["a", "b"], extraEnvironment = {}) {
@@ -140,45 +154,17 @@ export async function saved(client) {
 }
 
 export async function connectControl(t, environments) {
-  const clerk = await http((request, response) => json(response, {
-    access_token: "unregister-clerk-access", refresh_token: "unregister-clerk-refresh",
-    id_token: `header.${Buffer.from(JSON.stringify({ sub: "unregister-account" })).toString("base64url")}.signature`,
-    expires_in: 3600, token_type: "Bearer",
-  }));
-  const relay = await http((request, response) => {
-    if (request.url === "/v1/environments") {
-      return json(response, { environments: environments.map((environment) => ({
-        environmentId: environment.id, label: environment.id,
-        endpoint: { httpBaseUrl: environment.baseUrl, wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"), providerKind: "manual" },
-        linkedAt: "2026-09-20T00:00:00.000Z",
-      })) });
-    }
-    if (request.url === "/v1/client/dpop-token") {
-      return json(response, { access_token: "unregister-relay-session", token_type: "DPoP",
-        issued_token_type: "urn:ietf:params:oauth:token-type:access_token", expires_in: 3600, scope: "environment:connect" });
-    }
-    const id = request.url?.match(/^\/v1\/environments\/([^/]+)\/connect$/)?.[1];
-    const environment = environments.find((entry) => entry.id === id);
-    if (environment) {
-      return json(response, { environmentId: id,
-        endpoint: { httpBaseUrl: environment.baseUrl, wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"), providerKind: "manual" },
-        credential: `connect-${id}`, expiresAt: new Date(Date.now() + 120_000).toISOString() });
-    }
-    json(response, { error: "not_found" }, 404);
-  });
-  t.after(async () => { await clerk.close(); await relay.close(); });
-  return {
-    T3_MCP_CONNECT_RELAY_URL: relay.baseUrl,
-    T3_MCP_CONNECT_TOKEN_ENDPOINT: `${clerk.baseUrl}/oauth/token`,
-    T3_MCP_CONNECT_CLIENT_ID: "unregister-client",
-    T3_MCP_CONNECT_HOSTED_APP_URL: "https://app.t3.codes",
-  };
+  const control = await startConnectControl(environments.map((environment) => ({ ...environment, connectGrant: `connect-${environment.id}` })));
+  t.after(() => control.close());
+  controls.set(control.env, control);
+  return control.env;
 }
 
-export async function login(client) {
+export async function login(client, env) {
   const authentication = success(await call(client, "connect_authenticate")).authentication;
   assert.equal(authentication.status, "pending");
   const fragment = new URLSearchParams(new URL(authentication.authorizationUrl).hash.slice(1));
+  controls.get(env).authorize(fragment, "unregister-browser-code");
   const callback = await fetch(`http://127.0.0.1:${fragment.get("port")}/callback?state=${encodeURIComponent(fragment.get("state"))}&code=unregister-browser-code`);
   assert.equal(callback.status, 200);
   assert.equal(success(await call(client, "connect_authenticate", { action: "status" })).authentication.status, "authenticated");

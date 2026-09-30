@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { startConnectControl, verifyDpop } from "./support/connect-http.js";
 
 const connectorPath = path.join(process.cwd(), "dist", "index.js");
 
@@ -65,10 +66,15 @@ async function startEnvironment({
 } = {}) {
   const requests = [];
   const tokens = new Map();
+  const proofBindings = new Map();
+  const replay = new Set();
   const tokenFromRequest = (request) => {
     const match = request.headers.authorization?.match(/^(Bearer|DPoP) (.+)$/);
     if (!match || tokens.get(match[2]) !== match[1]) return undefined;
-    if (match[1] === "DPoP" && !request.headers.dpop) return undefined;
+    if (match[1] === "DPoP") {
+      try { verifyDpop(request, server.baseUrl, replay, { token: match[2], thumbprint: proofBindings.get(match[2]) }); }
+      catch { return undefined; }
+    }
     return match[2];
   };
   const server = await startHttpServer(async (request, response) => {
@@ -103,6 +109,12 @@ async function startEnvironment({
           subject_token: grant,
           access_token: "secret-error-token",
         });
+      }
+      if (dpopToken) {
+        try { verifyDpop(request, server.baseUrl, replay, { thumbprint: proofBindings.get(grant) }); }
+        catch { return jsonResponse(response, 401, { code: "invalid_proof" }); }
+        proofBindings.set(accessToken, proofBindings.get(grant));
+        dpopGrants.delete(grant);
       }
       tokens.set(accessToken, dpopToken ? "DPoP" : "Bearer");
       return jsonResponse(response, 200, {
@@ -193,109 +205,7 @@ async function startEnvironment({
     response.writeHead(404);
     response.end();
   });
-  return { ...server, requests, tokens };
-}
-
-function fakeJwtSubject(subject) {
-  const payload = Buffer.from(JSON.stringify({ sub: subject })).toString("base64url");
-  return `header.${payload}.signature`;
-}
-
-async function startConnectControl(environments) {
-  const clerkRequests = [];
-  const clerk = await startHttpServer(async (request, response) => {
-    const body = await readBody(request);
-    clerkRequests.push({ method: request.method, path: request.url, body });
-    if (request.method === "POST" && request.url === "/oauth/token") {
-      const form = new URLSearchParams(body);
-      if (form.get("grant_type") === "authorization_code" && form.get("code") === "browser-code") {
-        return jsonResponse(response, 200, {
-          access_token: "clerk-access-token",
-          refresh_token: "clerk-refresh-token",
-          id_token: fakeJwtSubject("connect-account-a"),
-          expires_in: 3600,
-          token_type: "Bearer",
-        });
-      }
-      if (form.get("grant_type") === "refresh_token") {
-        return jsonResponse(response, 200, {
-          access_token: "clerk-refreshed-token",
-          refresh_token: "clerk-refresh-token",
-          id_token: fakeJwtSubject("connect-account-a"),
-          expires_in: 3600,
-          token_type: "Bearer",
-        });
-      }
-    }
-    return jsonResponse(response, 400, { error: "invalid_request" });
-  });
-
-  const relayRequests = [];
-  const relay = await startHttpServer(async (request, response) => {
-    const body = await readBody(request);
-    relayRequests.push({ method: request.method, path: request.url, headers: request.headers, body });
-    if (request.method === "GET" && request.url === "/v1/environments") {
-      if (request.headers.authorization !== "Bearer clerk-access-token" && request.headers.authorization !== "Bearer clerk-refreshed-token") {
-        return jsonResponse(response, 401, { code: "auth_invalid" });
-      }
-      return jsonResponse(response, 200, {
-        environments: environments.map((environment) => ({
-          environmentId: environment.id,
-          label: environment.label,
-          endpoint: {
-            httpBaseUrl: environment.baseUrl,
-            wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"),
-            providerKind: "manual",
-          },
-          linkedAt: "2026-09-20T00:00:00.000Z",
-        })),
-      });
-    }
-    if (request.method === "POST" && request.url === "/v1/client/dpop-token") {
-      if (!request.headers.dpop) return jsonResponse(response, 401, { code: "auth_invalid" });
-      return jsonResponse(response, 200, {
-        access_token: "relay-dpop-token",
-        issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
-        token_type: "DPoP",
-        expires_in: 3600,
-        scope: "environment:connect",
-      });
-    }
-    const connectMatch = request.url?.match(/^\/v1\/environments\/([^/]+)\/connect$/);
-    if (request.method === "POST" && connectMatch) {
-      if (request.headers.authorization !== "DPoP relay-dpop-token" || !request.headers.dpop) {
-        return jsonResponse(response, 401, { code: "auth_invalid" });
-      }
-      const environment = environments.find((entry) => entry.id === decodeURIComponent(connectMatch[1]));
-      if (!environment) return jsonResponse(response, 404, { code: "not_found" });
-      return jsonResponse(response, 200, {
-        environmentId: environment.id,
-        endpoint: {
-          httpBaseUrl: environment.baseUrl,
-          wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"),
-          providerKind: "manual",
-        },
-        credential: environment.connectGrant,
-        expiresAt: new Date(Date.now() + 120_000).toISOString(),
-      });
-    }
-    return jsonResponse(response, 404, { code: "not_found" });
-  });
-
-  return {
-    env: {
-      T3_MCP_CONNECT_RELAY_URL: relay.baseUrl,
-      T3_MCP_CONNECT_TOKEN_ENDPOINT: `${clerk.baseUrl}/oauth/token`,
-      T3_MCP_CONNECT_CLIENT_ID: "connect-client",
-      T3_MCP_CONNECT_HOSTED_APP_URL: "https://app.t3.codes",
-    },
-    clerkRequests,
-    relayRequests,
-    close: async () => {
-      await clerk.close();
-      await relay.close();
-    },
-  };
+  return { ...server, requests, tokens, bindBootstrap: (grant, jkt) => proofBindings.set(grant, jkt) };
 }
 
 async function connectClient(stateDirectory, extraEnvironment = {}) {
@@ -558,8 +468,8 @@ test("authenticates with Connect, discovers without registering, attaches, regis
     projects: [{ id: "project-b", title: "Beta project" }],
   });
   const connect = await startConnectControl([
-    { id: "environment-a", label: "Alpha Connect", baseUrl: environmentA.baseUrl, connectGrant: "connect-grant-a" },
-    { id: "environment-b", label: "Beta Connect", baseUrl: environmentB.baseUrl, connectGrant: "connect-grant-b" },
+    { ...environmentA, id: "environment-a", label: "Alpha Connect", connectGrant: "connect-grant-a" },
+    { ...environmentB, id: "environment-b", label: "Beta Connect", connectGrant: "connect-grant-b" },
   ]);
   let client;
   let restartedClient;
@@ -576,6 +486,7 @@ test("authenticates with Connect, discovers without registering, attaches, regis
     assert.equal(content(started).authentication.status, "pending");
     const authorization = new URL(authorizationUrl);
     const fragment = new URLSearchParams(authorization.hash.slice(1));
+    connect.authorize(fragment);
     const callback = await fetch(
       `http://127.0.0.1:${fragment.get("port")}/callback?state=${encodeURIComponent(fragment.get("state"))}&code=browser-code`,
     );
