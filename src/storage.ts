@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, lstatSync, openSync, readSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -314,6 +314,7 @@ export class ConnectStore {
   private readonly snapshots = new WeakMap<ConnectAuth, number>();
   private mutations: Promise<unknown> = Promise.resolve();
   private owner: string | undefined;
+  private ownerFd: number | undefined;
 
   get generation(): number {
     return this.revision;
@@ -322,7 +323,11 @@ export class ConnectStore {
   assertOwner(): void {
     if (!this.owner) return;
     try {
-      if (readFileSync(path.join(this.directory, ".connect-owner"), "utf8") === this.owner) return;
+      const descriptor = this.ownerFd;
+      if (descriptor === undefined) throw invalidStore();
+      const held = fstatSync(descriptor), current = lstatSync(path.join(this.directory, ".connect-owner"));
+      if (current.isFile() && !current.isSymbolicLink() && isPrivateMode(current.mode) &&
+        current.dev === held.dev && current.ino === held.ino && this.readOwner(descriptor) === this.owner) return;
     } catch { /* The credential lease was lost. */ }
     throw new ConnectorError("storage_error", "Connect credential ownership changed; restart with a private state directory.");
   }
@@ -474,40 +479,57 @@ export class ConnectStore {
 
   private async ensureDirectory(): Promise<void> {
     await ensurePrivateDirectory(this.directory);
-    this.acquireOwner();
+    await this.acquireOwner();
   }
 
-  private acquireOwner(): void {
+  private readOwner(descriptor: number): string {
+    const size = fstatSync(descriptor).size;
+    if (size > 1024) throw invalidStore();
+    const data = Buffer.alloc(size);
+    readSync(descriptor, data, 0, size, 0);
+    return data.toString("utf8");
+  }
+
+  private async acquireOwner(): Promise<void> {
     if (this.owner) { this.assertOwner(); return; }
     const lock = path.join(this.directory, ".connect-owner");
-    const value = JSON.stringify({ pid: process.pid, nonce: randomUUID() });
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const descriptor = openSync(lock, "wx", 0o600);
-        try { writeFileSync(descriptor, value); } finally { closeSync(descriptor); }
-        this.owner = value;
-        process.once("exit", () => {
-          try { if (readFileSync(lock, "utf8") === value) unlinkSync(lock); } catch { /* Already released. */ }
-        });
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw invalidStore();
-        try {
-          const file = lstatSync(lock);
-          if (!file.isFile() || file.isSymbolicLink() || !isPrivateMode(file.mode)) throw invalidStore();
-          const retained = readFileSync(lock, "utf8");
-          const pid = (JSON.parse(retained) as { pid?: unknown }).pid;
-          if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) throw invalidStore();
-          try { process.kill(pid, 0); }
-          catch (probe) {
-            if ((probe as NodeJS.ErrnoException).code === "ESRCH" && readFileSync(lock, "utf8") === retained) {
-              unlinkSync(lock); continue;
-            }
-          }
-        } catch (failure) { if ((failure as NodeJS.ErrnoException).code === "ENOENT") continue; }
-        throw new ConnectorError("storage_error", "Connect credentials are owned by another connector process or unavailable; use one process per private state directory.");
+    let descriptor: number | undefined;
+    try {
+      const { tryLock } = await import("fs-native-extensions");
+      // A stable inode is mandatory: kernel locks serialize acquisition and stale
+      // metadata replacement. Neither crash recovery nor normal exit unlinks it.
+      descriptor = openSync(lock, constants.O_RDWR | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+      const file = fstatSync(descriptor), named = lstatSync(lock);
+      if (!file.isFile() || !isPrivateMode(file.mode) || named.isSymbolicLink() ||
+        file.dev !== named.dev || file.ino !== named.ino) throw invalidStore();
+      if (!tryLock(descriptor)) throw new ConnectorError("storage_error", "Connect credentials are owned by another connector process; use one process per private state directory.");
+      const retained = this.readOwner(descriptor);
+      if (retained) {
+        const previous = JSON.parse(retained) as { lockVersion?: number; pid?: unknown };
+        // Upgrade old PID-only locks only after an actual ESRCH observation.
+        // EPERM and invalid metadata fail closed; PID checks never arbitrate v2 locks.
+        if (previous.lockVersion !== 2) {
+          if (typeof previous.pid !== "number" || !Number.isSafeInteger(previous.pid) || previous.pid <= 0) throw invalidStore();
+          let dead = false;
+          try { process.kill(previous.pid, 0); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") dead = true; else throw invalidStore(); }
+          if (!dead) throw new ConnectorError("storage_error", "An older connector still owns these credentials; stop it before starting this process.");
+        }
       }
+      const value = JSON.stringify({ lockVersion: 2, pid: process.pid, nonce: randomUUID() });
+      ftruncateSync(descriptor, 0);
+      writeFileSync(descriptor, value);
+      fsyncSync(descriptor);
+      this.owner = value;
+      this.ownerFd = descriptor;
+      const owned = descriptor;
+      process.once("exit", () => { closeSync(owned); });
+      descriptor = undefined;
+    } catch (error) {
+      if (error instanceof ConnectorError) throw error;
+      throw invalidStore();
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
     }
-    throw invalidStore();
   }
 }

@@ -16,6 +16,8 @@ export interface BrowserGrant {
   readonly accessToken: string;
   readonly expiresAt: string;
 }
+/** Object identity binds cleanup/read operations to one opening, not a reusable profile ID. */
+export interface BrowserLease { readonly profile: string; }
 interface ClerkSession {
   readonly id: string;
   readonly status: string;
@@ -27,11 +29,13 @@ interface ClerkWindow extends Window {
   Clerk?: {
     loaded: boolean;
     session?: ClerkSession | null;
+    client?: { signIn?: unknown };
     openSignIn(): void;
     signOut(options: { sessionId: string }): Promise<void>;
   };
 }
 interface OwnedBrowser {
+  readonly lease: BrowserLease;
   readonly opening: Promise<BrowserContext>;
   context?: BrowserContext;
   page?: Page;
@@ -79,9 +83,9 @@ export class BrowserProfiles {
     return path.join(this.root, profile);
   }
 
-  assertOpen(profile: string): void {
-    const owned = this.browsers.get(profile);
-    if (!owned?.page || owned.closed || owned.page.isClosed()) {
+  assertOpen(lease: BrowserLease): void {
+    const owned = this.browsers.get(lease.profile);
+    if (owned?.lease !== lease || !owned.page || owned.closed || owned.page.isClosed()) {
       throw new ConnectorError("connect_auth_cancelled", "The connector-owned login browser was closed. Start authentication again.");
     }
   }
@@ -102,7 +106,7 @@ export class BrowserProfiles {
     }
   }
 
-  async open(profile: string, settings: BrowserAuthConfig, interactive: boolean, active: () => void): Promise<void> {
+  async open(profile: string, settings: BrowserAuthConfig, interactive: boolean, active: () => void): Promise<BrowserLease> {
     active();
     const browserPath = await executable();
     await privateDirectory(this.root);
@@ -135,7 +139,8 @@ export class BrowserProfiles {
       args: ["--no-first-run", "--no-default-browser-check"],
       env: { ...process.env, DEBUG: "", PWDEBUG: "" },
     });
-    const owned: OwnedBrowser = { opening, closed: false };
+    const lease: BrowserLease = { profile };
+    const owned: OwnedBrowser = { lease, opening, closed: false };
     this.browsers.set(profile, owned);
     try {
       owned.context = await opening;
@@ -154,28 +159,58 @@ export class BrowserProfiles {
         });
       }
     } catch (error) {
-      await this.close(profile);
+      await this.close(lease);
       active();
       if (error instanceof ConnectorError) throw error;
       throw new ConnectorError("connect_auth_failed", "The owned Connect browser could not open the hosted Clerk UI. Check the browser executable, graphical desktop and network, then start authentication again.");
     }
+    return lease;
   }
 
-  async read(profile: string, settings: BrowserAuthConfig, active: () => void): Promise<BrowserGrant | null> {
+  async read(lease: BrowserLease, settings: BrowserAuthConfig, active: () => void): Promise<BrowserGrant | null> {
     active();
-    this.assertOpen(profile);
-    const owned = this.browsers.get(profile);
-    if (!owned?.page || owned.closed || owned.page.isClosed()) {
+    this.assertOpen(lease);
+    const owned = this.browsers.get(lease.profile);
+    if (owned?.lease !== lease || !owned.page || owned.closed || owned.page.isClosed()) {
       throw new ConnectorError("connect_auth_cancelled", "The connector-owned login browser was closed. Start authentication again.");
     }
     if (new URL(owned.page.url()).origin !== new URL(settings.hostedAppUrl).origin) return null;
-    let value: { sessionId: string; accountId: string; token: string | null } | null;
+    let value: { sessionId: string; accountId: string; token: string | null } |
+      { failure: "denied" | "expired" | "malformed" } | null;
     try {
       value = await Promise.race([
         owned.page.evaluate(async (template) => {
           const clerk = (window as ClerkWindow).Clerk;
           const session = clerk?.session;
-          if (!clerk?.loaded || !session || session.status !== "active" || session.currentTask) return null;
+          if (!clerk?.loaded) return null;
+          if (!session || session.status !== "active" || session.currentTask) {
+            const signIn = clerk.client?.signIn;
+            if (signIn === undefined || signIn === null) return null;
+            if (typeof signIn !== "object" || Array.isArray(signIn)) return { failure: "malformed" as const };
+            // Public VerificationResource fields only. Do not choose a factor or
+            // copy its error/message/redirect into the private delivery result.
+            for (const key of ["firstFactorVerification", "secondFactorVerification"]) {
+              const verification = (signIn as Record<string, unknown>)[key];
+              if (verification === undefined || verification === null) continue;
+              if (typeof verification !== "object" || Array.isArray(verification)) return { failure: "malformed" as const };
+              const { status, error } = verification as Record<string, unknown>;
+              if (status !== undefined && status !== null &&
+                (typeof status !== "string" || !["unverified", "verified", "transferable", "failed", "expired"].includes(status))) return { failure: "malformed" as const };
+              let code: string | undefined;
+              if (error !== undefined && error !== null) {
+                if (typeof error !== "object" || Array.isArray(error) ||
+                  typeof (error as Record<string, unknown>).code !== "string" || !(error as Record<string, unknown>).code) return { failure: "malformed" as const };
+                code = (error as { code: string }).code;
+              }
+              if (status === "expired") return { failure: "expired" as const };
+              if (status === "failed" && (!code || ["oauth_access_denied", "not_allowed_access", "user_locked", "user_banned", "user_deactivated"].includes(code))) {
+                return { failure: "denied" as const };
+              }
+              // Incorrect codes/passwords and popup cancellation remain under the
+              // SDK's retry handling, rather than becoming connector restrictions.
+            }
+            return null;
+          }
           const sessionId = session.id, accountId = session.user.id;
           const token = await session.getToken({ template, skipCache: true });
           if (clerk.session?.id !== sessionId || clerk.session.user.id !== accountId) throw new Error("Session changed");
@@ -193,8 +228,13 @@ export class BrowserProfiles {
       throw new ConnectorError("connect_unavailable", "The hosted Clerk session could not issue a template token. Complete sign-in in the owned browser or retry authentication.");
     }
     active();
-    this.assertOpen(profile);
+    this.assertOpen(lease);
     if (!value) return null;
+    if ("failure" in value) {
+      if (value.failure === "malformed") throw new ConnectorError("upstream_incompatible", "Clerk returned an invalid sign-in verification state.");
+      if (value.failure === "expired") throw new ConnectorError("connect_auth_expired", "The service sign-in verification expired. Start authentication again.");
+      throw new ConnectorError("connect_auth_failed", "The service denied or rejected this sign-in attempt. Start authentication again.");
+    }
     if (!value.token) throw new ConnectorError("upstream_incompatible", "The active Clerk session did not issue a relay template JWT.");
     try {
       if (!value.sessionId || !value.accountId || /\s/.test(value.token)) throw new Error();
@@ -223,27 +263,31 @@ export class BrowserProfiles {
     finally { await this.discard(profile); }
   }
 
-  async close(profile: string): Promise<void> {
-    const owned = this.browsers.get(profile);
-    if (!owned) return;
+  async close(lease: BrowserLease): Promise<void> {
+    const owned = this.browsers.get(lease.profile);
+    if (owned?.lease !== lease) return;
     if (owned.closing) return owned.closing;
     owned.closed = true;
     const closing = (async () => {
       try { await (owned.context ?? await owned.opening).close(); } catch { /* Browser already exited. */ }
-      if (this.browsers.get(profile) === owned) this.browsers.delete(profile);
+      if (this.browsers.get(lease.profile) === owned) this.browsers.delete(lease.profile);
     })();
     owned.closing = closing;
     await closing;
   }
 
   async discard(profile: string): Promise<void> {
-    await this.close(profile);
+    const owned = this.browsers.get(profile);
+    if (owned) await this.close(owned.lease);
     const directory = this.profilePath(profile);
     try {
       const root = await lstat(this.root);
       if (!root.isDirectory() || root.isSymbolicLink() || (root.mode & 0o077) !== 0) throw new Error();
       await this.verifyProfile(profile);
-      await rm(directory, { recursive: true, force: true });
+      // An externally closed context can resolve close() before Chromium's late
+      // cache/metrics writes finish. Retry transient busy/not-empty removal races
+      // within a bounded window; final permission/ownership failures still fail.
+      await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new ConnectorError("storage_error", "The owned Connect browser profile could not be removed.");
     }
@@ -261,7 +305,10 @@ export class BrowserProfiles {
         if (!/^[a-f0-9-]{36}$/.test(profile)) continue;
         // Remove only directories bearing our ownership marker, including interrupted logins.
         try { await this.verifyProfile(profile); }
-        catch { continue; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
         if (!active()) return;
         await this.discard(profile);
       }
@@ -270,5 +317,5 @@ export class BrowserProfiles {
     }
   }
 
-  async closeAll(): Promise<void> { await Promise.all([...this.browsers.keys()].map((profile) => this.close(profile))); }
+  async closeAll(): Promise<void> { await Promise.all([...this.browsers.values()].map((owned) => this.close(owned.lease))); }
 }

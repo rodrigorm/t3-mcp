@@ -6,7 +6,7 @@ import { ConnectStore, type ConnectAuth } from "./storage.js";
 import { safePayload } from "./secrets.js";
 import { pairConnectEnvironment } from "./upstream.js";
 import { parseEndpoint } from "./url.js";
-import { BrowserProfiles, type BrowserAuthConfig } from "./browser-auth.js";
+import { BrowserProfiles, type BrowserAuthConfig, type BrowserLease } from "./browser-auth.js";
 import type { DpopPrivateJwk, PairingResult } from "./types.js";
 
 const AUTH_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -39,6 +39,7 @@ interface PendingAuthorization {
   readonly timer: NodeJS.Timeout;
   readonly generation: number;
   ready: boolean;
+  lease?: BrowserLease;
   poll?: Promise<PublicConnectAuth>;
 }
 
@@ -152,7 +153,7 @@ export class ConnectManager {
     this.pending = pending;
     try {
       if (!await this.store.stageProfile(pending.profile, generation)) this.requireGeneration(-1);
-      await this.browser.open(pending.profile, settings, true, assertActive);
+      pending.lease = await this.browser.open(pending.profile, settings, true, assertActive);
       assertActive();
       pending.ready = true;
       this.last = publicAuth("pending", pending);
@@ -177,10 +178,10 @@ export class ConnectManager {
     const active = () => {
       this.requireGeneration(pending.generation);
       if (this.pending !== pending) this.requireGeneration(-1);
-      if (!flushing) this.browser.assertOpen(pending.profile);
+      if (!flushing) this.browser.assertOpen(pending.lease!);
     };
     try {
-      const grant = await this.browser.read(pending.profile, pending.settings, active);
+      const grant = await this.browser.read(pending.lease!, pending.settings, active);
       active();
       if (!grant) return publicAuth("pending", pending);
       const existing = await this.store.read(); active();
@@ -193,7 +194,7 @@ export class ConnectManager {
         browserProfile: pending.profile, dpopPrivateJwk: pending.key };
       await this.discover(pending.settings, auth, active); active();
       flushing = true;
-      await this.browser.close(pending.profile); active();
+      await this.browser.close(pending.lease!); active();
       if (!await this.store.replace(auth, pending.generation)) this.requireGeneration(-1);
       active();
       this.validatedProfile = auth.browserProfile;
@@ -299,22 +300,23 @@ export class ConnectManager {
     this.remember(auth);
     if (this.validatedProfile === auth.browserProfile && Date.parse(auth.expiresAt) > Date.now() + 5_000) return auth;
     const active = () => this.requireGeneration(generation);
+    let lease: BrowserLease | undefined;
     try {
-      await this.browser.open(auth.browserProfile, settings, false, active);
-      const grant = await this.browser.read(auth.browserProfile, settings, active); active();
+      lease = await this.browser.open(auth.browserProfile, settings, false, active);
+      const grant = await this.browser.read(lease, settings, active); active();
       if (!grant) throw new ConnectorError("connect_auth_expired", "The owned Clerk browser session expired or needs operator sign-in. Start authentication again.");
       if (grant.accountId !== auth.accountId) throw new ConnectorError("connect_account_conflict", "A different T3 Connect account was returned; sign out before switching accounts.");
       this.secrets.add(grant.accessToken);
       const refreshed = { ...auth, ...grant };
       await this.discover(settings, refreshed, active); active();
       if (!await this.store.replace(refreshed, generation, auth)) this.requireGeneration(-1);
-      await this.browser.close(auth.browserProfile); active();
+      await this.browser.close(lease); active();
       this.validatedProfile = refreshed.browserProfile;
       this.last = { status: "authenticated" }; return refreshed;
     } catch (error) {
       if (error instanceof ConnectorError && error.code === "connect_auth_expired") await this.invalidateAuth(auth, generation);
       throw error;
-    } finally { await this.browser.close(auth.browserProfile); }
+    } finally { if (lease) await this.browser.close(lease); }
   }
 
   private async invalidateAuth(auth: ConnectAuth, generation: number): Promise<void> {
@@ -362,10 +364,16 @@ export class ConnectManager {
     if (!selectedId) throw new ConnectorError("invalid_input", "environmentId is required.");
     const settings = config(), generation = this.store.generation, lifecycle = this.lifecycle;
     const assertActive = () => { this.requireGeneration(generation); this.requireLifecycle(lifecycle); };
-    const auth = await this.authToken(); assertActive();
+    const selectedAuth = await this.authToken(); assertActive();
     const environments = await this.listEnvironments(); assertActive();
     const environment = environments.find((entry) => entry.id === selectedId);
     if (!environment) throw new ConnectorError("connect_environment_not_found", "The selected Connect environment is unavailable.");
+    // Discovery can take longer than the remaining template lifetime. Read the
+    // current subject at the exchange boundary without changing account/key ownership.
+    const auth = await this.authToken(); assertActive();
+    if (auth.accountId !== selectedAuth.accountId || dpopThumbprint(auth.dpopPrivateJwk) !== dpopThumbprint(selectedAuth.dpopPrivateJwk)) {
+      throw new ConnectorError("connect_account_conflict", "Connect account or proof-key ownership changed during discovery; authenticate again.");
+    }
     const relayToken = await this.relayAccessToken(settings, auth, assertActive); assertActive();
     const key = auth.dpopPrivateJwk;
     const connectUrl = `${settings.relayUrl}v1/environments/${encodeURIComponent(selectedId)}/connect`;

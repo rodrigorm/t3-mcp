@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { watch } from "node:fs";
-import { chmod, readFile, readlink, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readlink, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fixture, login, call, success, failure, operatorLogin, relaySubjectJwt, startConnectEnvironment } from "./support/connect-http.js";
@@ -80,6 +81,27 @@ test("short template expiry and concurrent renewal are handled by the service SD
   assert.equal(f.control.clerkRequests.filter((request) => request.path === "/v1/sign_in").length, 1);
 });
 
+test("registration refreshes a short JWT after held discovery and before the strict relay exchange", async (t) => {
+  const remote = await startConnectEnvironment("remote");
+  const short = relaySubjectJwt("t3-code-relay", "connect-account-a", 10);
+  const f = await fixture(t, [remote], { accessToken: short }); const { client } = await f.client(); await login(client, f.control);
+  const original = (await saved(f)).auth;
+  const g = gate(); t.after(g.release); let held = false;
+  f.control.state.beforeDiscovery = async () => { if (!held) { held = true; await g.wait(); } };
+  const registration = call(client, "register_connect_environment", { environmentId: "remote" }); await g.entered;
+  // Advance only the controlled issuer/relay clock and the approved cache-expiry
+  // fixture. Discovery was already authorized, but its subject is now expired.
+  const claims = JSON.parse(Buffer.from(short.split(".")[1], "base64url"));
+  f.control.state.subjectNow = claims.exp + 1;
+  f.control.state.accessToken = relaySubjectJwt();
+  await expire(f); g.release();
+  success(await registration);
+  const current = (await saved(f)).auth;
+  assert.equal(current.accountId, original.accountId); assert.deepEqual(current.dpopPrivateJwk, original.dpopPrivateJwk);
+  assert.equal(f.control.clerkRequests.filter((request) => request.path.endsWith("/tokens/t3-relay")).length, 2);
+  assert.equal(f.control.clerkRequests.filter((request) => request.path === "/v1/sign_in").length, 1);
+});
+
 test("all provider/challenge choices belong to the service UI; pending tasks cannot produce a connector grant", async (t) => {
   const f = await fixture(t, [], { tasks: [{ key: "service-task" }] });
   const { client } = await f.client();
@@ -89,6 +111,105 @@ test("all provider/challenge choices belong to the service UI; pending tasks can
   assert.equal(f.control.clerkRequests.some((request) => request.path.includes("/tokens/")), false);
   await call(client, "connect_authenticate", { action: "cancel" });
   assert.equal((await status(client)).status, "cancelled");
+});
+
+test("provider denial is reported from the public SDK verification resource without reflecting service errors", async (t) => {
+  const f = await fixture(t); const { client, stderr } = await f.client();
+  const url = await start(client); await operatorLogin(url, "provider_denied");
+  for (let n = 0; n < 100; n += 1) {
+    if (f.control.clerkRequests.some((request) => request.path === "provider/deny")) break;
+    await pause(20);
+  }
+  await pause(100);
+  const result = await status(client);
+  assert.equal(result.status, "failed"); assert.equal(result.error.code, "connect_auth_failed");
+  assert.equal(JSON.stringify(result).includes("fixture-provider-secret"), false);
+  assert.equal(stderr().includes("fixture-provider-secret"), false);
+  assert.equal(f.control.clerkRequests.some((request) => request.path.includes("/tokens/")), false);
+});
+
+test("malformed public SDK verification states fail safely and expired verification is terminal", async (t) => {
+  const f = await fixture(t); const { client } = await f.client();
+  for (const resource of ["fixture-provider-secret", { firstFactorVerification: [] },
+    { firstFactorVerification: { status: "denied", error: null } },
+    { firstFactorVerification: { status: ["unverified"], error: null } },
+    { secondFactorVerification: { status: "failed", error: { code: 42, message: "fixture-provider-secret" } } }]) {
+    f.control.state.signInResource = resource;
+    await start(client);
+    const result = await status(client);
+    assert.equal(result.status, "failed"); assert.equal(result.error.code, "upstream_incompatible");
+    assert.equal(JSON.stringify(result).includes("fixture-provider-secret"), false);
+  }
+  f.control.state.signInResource = { secondFactorVerification: { status: "expired", error: null } };
+  await start(client);
+  assert.equal((await status(client)).error.code, "connect_auth_expired");
+});
+
+test("retryable SDK verification errors keep the official UI available for a successful retry", async (t) => {
+  const f = await fixture(t, [], { firstVerification: { status: "failed", error: { code: "form_code_incorrect", message: "fixture-provider-secret" } } });
+  const { client } = await f.client(); const url = await start(client);
+  const pending = await status(client); assert.equal(pending.status, "pending");
+  assert.equal(JSON.stringify(pending).includes("fixture-provider-secret"), false);
+  await operatorLogin(url);
+  assert.equal((await terminal(client)).status, "authenticated");
+});
+
+test("an actual provider popup completes MFA and propagates its session through the parent service SDK", async (t) => {
+  const f = await fixture(t); const { client } = await f.client();
+  const url = await start(client); await operatorLogin(url, "popup_mfa");
+  assert.equal((await terminal(client)).status, "authenticated");
+  assert.ok(f.control.clerkRequests.some((request) => request.path === "provider/verify"));
+  assert.equal(f.control.clerkRequests.some((request) => request.path === "/v1/sign_in"), false);
+  assert.ok(f.control.clerkRequests.filter((request) => request.path === "/v1/client").length >= 3);
+});
+
+test("a denied provider popup propagates terminal SDK verification state without a false success", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); const url = await start(client);
+  await operatorLogin(url, "popup_denied");
+  const result = await terminal(client);
+  assert.equal(result.status, "failed"); assert.equal(result.error.code, "connect_auth_failed");
+  assert.equal(JSON.stringify(result).includes("fixture-provider-secret"), false);
+  assert.equal(f.control.clerkRequests.some((request) => request.path.includes("/tokens/")), false);
+});
+
+test("a service-cancelled popup closes while the parent remains pending and permits an official UI retry", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); const url = await start(client);
+  await operatorLogin(url, "popup_cancel");
+  for (let n = 0; n < 100; n += 1) {
+    if (f.control.clerkRequests.some((request) => request.path === "provider/cancel") &&
+      f.control.clerkRequests.filter((request) => request.path === "/v1/client").length >= 2) break;
+    await pause(20);
+  }
+  assert.equal((await status(client)).status, "pending");
+  await operatorLogin(url, "popup_mfa");
+  assert.equal((await terminal(client)).status, "authenticated");
+});
+
+test("closing a provider popup without a success callback leaves the parent SDK free to retry", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); const url = await start(client);
+  await operatorLogin(url, "popup_close");
+  for (let n = 0; n < 100; n += 1) {
+    if (f.control.clerkRequests.some((request) => request.path === "provider/authorize") &&
+      f.control.clerkRequests.filter((request) => request.path === "/v1/client").length >= 2) break;
+    await pause(20);
+  }
+  assert.equal((await status(client)).status, "pending");
+  assert.equal(f.control.clerkRequests.some((request) => request.path === "provider/verify"), false);
+  await operatorLogin(url, "popup_mfa");
+  assert.equal((await terminal(client)).status, "authenticated");
+});
+
+test("connector cancellation closes the parent and a held provider popup without saving late completion", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); const url = await start(client);
+  const g = gate(); t.after(g.release);
+  f.control.state.beforeProvider = async (pathname) => { if (pathname === "/verify") await g.wait(); };
+  await operatorLogin(url, "popup_mfa"); await g.entered;
+  assert.equal((await status(client)).status, "pending");
+  success(await call(client, "connect_authenticate", { action: "cancel" })); g.release();
+  assert.equal((await status(client)).status, "cancelled");
+  assert.deepEqual(await readdir(path.join(f.directory, "connect-browser-profiles")), []);
+  await client.close(); const restarted = await f.client();
+  assert.equal((await status(restarted.client)).status, "signed_out");
 });
 
 test("MCP accepts lifecycle actions, never identifiers, passwords, provider choices, cookies, codes or tokens", async (t) => {
@@ -131,6 +252,24 @@ test("a second stdio process cannot replay credentials from a profile owned by a
   assert.equal(f.control.clerkRequests.length, before);
   await first.client.close();
   assert.equal((await status(second.client)).status, "authenticated");
+});
+
+test("simultaneous MCP startup after a dead owner grants exactly one process the credential lock", async (t) => {
+  const f = await fixture(t);
+  const original = await f.client(); assert.equal((await status(original.client)).status, "signed_out");
+  const lockFile = path.join(f.directory, ".connect-owner"), inode = (await stat(lockFile)).ino;
+  const pid = original.pid(); assert.ok(pid > 0);
+  process.kill(pid, "SIGKILL"); await original.client.close();
+  const contenders = await Promise.all(Array.from({ length: 16 }, () => f.client()));
+  const results = await Promise.all(contenders.map(({ client }) => call(client, "connect_authenticate", { action: "status" })));
+  const winners = results.map((result, index) => result.isError ? -1 : index).filter((index) => index >= 0);
+  assert.equal(winners.length, 1, "OS ownership must have one winner, including stale-owner startup");
+  assert.equal((await stat(lockFile)).ino, inode, "The guarded lock inode must never be unlinked or replaced");
+  for (const result of results.filter((result) => result.isError)) failure(result, "storage_error");
+  assert.equal((await status(contenders[winners[0]].client)).status, "signed_out");
+  await contenders[winners[0]].client.close();
+  const successor = contenders.find((_entry, index) => index !== winners[0]);
+  assert.equal((await status(successor.client)).status, "signed_out");
 });
 
 for (const options of [{ sessionStatus: "revoked" }, { sessionExpiresAt: 1 }]) {
@@ -218,6 +357,37 @@ test("closing the actual owned browser while pending cannot authenticate or alte
   assert.equal(result.status, "failed"); assert.equal(result.error.code, "connect_auth_cancelled");
   assert.equal(await readFile(path.join(f.directory, "environments.json"), "utf8"), before);
   success(await call(client, "list_projects", { environmentId: "direct" }));
+});
+
+test("profile removal coordinates with bounded late OS writes after the browser window exits", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); await start(client);
+  const profile = (await saved(f)).pendingProfile;
+  const directory = path.join(f.directory, "connect-browser-profiles", profile);
+  const lock = await readlink(path.join(directory, "SingletonLock"));
+  const pid = Number(lock.match(/-(\d+)$/)?.[1]); assert.ok(pid > 0 && pid !== process.pid);
+  // A real OS process models Chromium's late cache/metrics writes. It touches
+  // only this fixture's owned cache, never the ownership marker or auth state.
+  const writer = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { mkdir, writeFile } from 'node:fs/promises';
+    import path from 'node:path';
+    const directory = path.join(process.argv[1], 'late-exit-cache');
+    await mkdir(directory); process.send('ready');
+    const end = Date.now() + 500; let n = 0;
+    while (Date.now() < end) {
+      try {
+        await mkdir(directory, { recursive: false }).catch(e => { if (e.code !== 'EEXIST') throw e; });
+        await Promise.all(Array.from({length: 100}, () => writeFile(path.join(directory, 'entry-' + n++), 'fixture')));
+      } catch (e) { if (e.code === 'ENOENT') break; throw e; }
+    }
+  `, directory], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  t.after(() => { if (writer.exitCode === null) writer.kill(); });
+  await new Promise((resolve, reject) => { writer.once("message", resolve); writer.once("error", reject); });
+  const exited = new Promise((resolve) => writer.once("exit", resolve));
+  process.kill(pid, "SIGTERM");
+  const result = await terminal(client);
+  assert.equal(result.error.code, "connect_auth_cancelled");
+  assert.equal(await exited, 0);
+  assert.deepEqual(await readdir(path.join(f.directory, "connect-browser-profiles")), []);
 });
 
 test("closing the owned window during relay verification cannot save a completed Clerk login", async (t) => {
@@ -320,6 +490,23 @@ test("a stale discovery 401 cannot retire a newer SDK-minted template or profile
   assert.equal((await status(client)).status, "authenticated");
 });
 
+test("a cancelled renewal's late cleanup cannot close a new browser instance on the same retained profile", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); await login(client, f.control); await expire(f);
+  const profile = (await saved(f)).auth.browserProfile;
+  const oldRelay = gate(), newTemplate = gate(); t.after(oldRelay.release); t.after(newTemplate.release);
+  let held = false;
+  f.control.state.beforeDiscovery = async () => { if (!held) { held = true; await oldRelay.wait(); } };
+  const old = call(client, "list_connect_environments"); await oldRelay.entered;
+  success(await call(client, "connect_authenticate", { action: "cancel" }));
+  f.control.state.beforeClerk = async (pathname) => { if (pathname.endsWith("/tokens/t3-relay")) await newTemplate.wait(); };
+  const replacement = call(client, "connect_authenticate", { action: "start" }); await newTemplate.entered;
+  oldRelay.release(); failure(await old, "connect_auth_cancelled");
+  newTemplate.release();
+  assert.equal(success(await replacement).authentication.status, "authenticated");
+  assert.equal((await saved(f)).auth.browserProfile, profile);
+  success(await call(client, "list_connect_environments"));
+});
+
 test("template/proof secret reflection is rejected in discovery metadata without exposing browser cookies", async (t) => {
   const remote = await startConnectEnvironment("remote"); const f = await fixture(t, [remote]);
   const { client, stderr } = await f.client(); await login(client, f.control);
@@ -362,6 +549,17 @@ test("private storage and profile symlinks fail with sanitized errors", async (t
   await symlink(f.directory, path.join(root, value.auth.browserProfile));
   const result = await call(client, "list_connect_environments"); failure(result, "storage_error");
   assert.equal(JSON.stringify(result).includes(f.directory), false);
+});
+
+test("profile cleanup reports ownership failures and preserves unrelated marked data", async (t) => {
+  const f = await fixture(t); const { client } = await f.client(); await login(client, f.control);
+  const foreign = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const directory = path.join(f.directory, "connect-browser-profiles", foreign);
+  await mkdir(directory, { mode: 0o700 });
+  await writeFile(path.join(directory, ".t3-mcp-profile.json"), JSON.stringify({ owner: "different-owner", profile: foreign }), { mode: 0o600 });
+  const file = path.join(directory, "keep.txt"); await writeFile(file, "preserve unrelated data", { mode: 0o600 });
+  failure(await call(client, "sign_out_connect"), "storage_error");
+  assert.equal(await readFile(file, "utf8"), "preserve unrelated data");
 });
 
 for (const version of [1, 2]) {

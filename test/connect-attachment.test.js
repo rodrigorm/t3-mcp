@@ -88,7 +88,7 @@ test("attaches legacy direct state without losing its session across Connect wor
   assert.equal(remote.commands.length, 3);
   assert.equal((await stat(file)).mode & 0o777, 0o600);
   assert.equal((await stat(f.directory)).mode & 0o777, 0o700);
-  assert.deepEqual((await readdir(f.directory)).sort(), ["connect-browser-profiles", "environments.json"]);
+  assert.deepEqual((await readdir(f.directory)).sort(), [".connect-owner", "connect-browser-profiles", "environments.json"]);
   const state = await readFile(file, "utf8");
   assert.equal(state.includes("bootstrap-"), false);
   assert.equal(state.includes(f.control.state.accessToken), false);
