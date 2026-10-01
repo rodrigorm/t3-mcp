@@ -30,20 +30,19 @@ the exchange. The bearer session is stored privately for later workflow slices.
 ## Experimental T3 Connect contract
 
 Connect is optional and does not replace direct pairing. `connect_authenticate` returns a
-connector-owned loopback login URL. Node creates its own native Clerk client, stores response
-Authorization rotations privately and drives the existing-account sign-in statuses and offered
-email-code/password factors. Offered second factors/client-trust verification must complete.
-Unsupported strategies, session tasks or challenges report specific recovery guidance.
+public hosted root and opens its actual Clerk UI in an owned headed browser profile.
+Any method offered there is valid. The operator alone handles providers, MFA, passkeys,
+verification and challenges; the connector does not implement or filter factor strategies.
 
 After authentication, `list_connect_environments` uses the Connect relay for discovery only. The
-connector never saves a discovered environment implicitly. The public native session-template
-endpoint supplies the relay-audience JWT. Authentication completes only after the owned
-session/account checks and relay discovery succeed. The native client credential and cached
-template JWT/expiry are separate; restart verifies ownership and renews through Clerk. No CLI
-OAuth code exchange, refresh token or upstream handoff is required. See
+connector never saves a discovered environment implicitly. Node privately calls the supported
+`Clerk.session.getToken({ template: "t3-relay", skipCache: true })` method in the owned
+browser. Authentication completes after session/account checks and relay discovery succeed.
+Owned browser cookies and the cached template JWT have separate lifecycles; restart reopens
+only that private profile headlessly and renews through the SDK. See
 [registration contract](connect-registration-contract.md).
 
-After Desktop-native authentication, `register_connect_environment` or
+After owned browser authentication, `register_connect_environment` or
 `attach_connect_environment` explicitly selects an environment, requests a relay DPoP-bound credential,
 and exchanges that credential at the environment's `/oauth/token` endpoint with a DPoP proof key.
 Connect environment requests use the resulting DPoP access token and proof; direct environment requests
@@ -142,17 +141,18 @@ either former endpoint, verifies another registration's usability, and checks re
 login/discovery. The packaged generic direct
 and Connect runners use that same installed MCP/HTTP boundary. Runner tests cover explicit targets,
 both registration modes, lifecycle checks, blocked/unknown stops without replay, stale-completion
-rejection, redacted summaries, and isolation from existing state. Native auth coverage includes
-header rotations on every FAPI response, single-session ownership, factors/client trust,
-short-template renewal without re-login, account pinning, revoked sessions, secret reflection,
-restart, configuration association, obsolete OAuth migration and concurrent cancellation/CAS.
+rejection, redacted summaries, and isolation from existing state. Actual-browser auth coverage
+includes external provider/MFA and direct service UI, cookie rotation, short-template renewal,
+account pinning, revoked sessions, secret reflection, same-profile restart, process ownership,
+profile/config association, old-auth migration, closed browsers, interrupted profile cleanup
+and concurrent cancellation/CAS/atomic-write races.
 Fixture success does not complete the real operator smoke.
 
 Unauthenticated production relay metadata returned HTTP 200 on 2026-09-30 and matched the exact
 relay issuer/resource, token endpoint, and ES256/DPoP declarations. No credentialed request or
 live login, registration, attachment, or turn was attempted. The earlier claim that Desktop
-login needs upstream authorization changes was incorrect. The public native FAPI and
-session-template contract provides that login. Connect stays EXPERIMENTAL and the real
+login needs upstream authorization changes was incorrect. The official hosted Clerk UI and
+public session-template SDK provide that login. Connect stays EXPERIMENTAL and the real
 operator smoke remains unperformed. See [repeatable smoke instructions](smoke-live.md).
 
 A live direct-pairing or Connect smoke check against a real T3 environment was not run for this release

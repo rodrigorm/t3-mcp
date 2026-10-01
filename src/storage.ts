@@ -269,12 +269,11 @@ export class EnvironmentStore {
 }
 
 export interface ConnectAuth {
-  /** Cached short-lived template JWT, never the native Client API credential. */
+  /** Cached short-lived template JWT. Browser cookies remain in the owned profile. */
   readonly accessToken: string;
-  readonly nativeClientToken: string;
   readonly sessionId: string;
-  readonly frontendApiUrl: string;
-  readonly publishableKey: string;
+  readonly browserProfile: string;
+  readonly hostedAppUrl: string;
   readonly jwtTemplate: string;
   readonly relayUrl: string;
   readonly expiresAt: string;
@@ -283,9 +282,9 @@ export interface ConnectAuth {
 }
 
 interface ConnectStoreFile {
-  readonly version: 2;
+  readonly version: 3;
   readonly auth?: ConnectAuth;
-  readonly pendingNative?: { readonly token: string; readonly frontendApiUrl: string };
+  readonly pendingProfile?: string;
 }
 
 function isConnectAuth(value: unknown): value is ConnectAuth {
@@ -294,10 +293,10 @@ function isConnectAuth(value: unknown): value is ConnectAuth {
   return (
     typeof auth.accessToken === "string" &&
     !/\s/.test(auth.accessToken) &&
-    typeof auth.nativeClientToken === "string" && !/\s/.test(auth.nativeClientToken) &&
     typeof auth.sessionId === "string" &&
-    typeof auth.frontendApiUrl === "string" &&
-    typeof auth.publishableKey === "string" &&
+    typeof auth.browserProfile === "string" &&
+    (auth.browserProfile === "" || /^[a-f0-9-]{36}$/.test(auth.browserProfile)) &&
+    typeof auth.hostedAppUrl === "string" &&
     typeof auth.jwtTemplate === "string" &&
     typeof auth.relayUrl === "string" &&
     typeof auth.expiresAt === "string" &&
@@ -354,21 +353,21 @@ export class ConnectStore {
 
     try {
       let parsed = JSON.parse(raw) as ConnectStoreFile;
-      // CLI OAuth state cannot renew a Desktop session. Keep its account pin, but
-      // discard the obsolete credentials. Environment sessions live in another file.
-      if ((parsed as { version: number }).version === 1) {
+      // Old OAuth/native credentials cannot rehydrate an owned browser session.
+      // Keep the account pin and independent environment credentials/keys.
+      if ([1, 2].includes((parsed as { version: number }).version)) {
         const legacy = parsed.auth as unknown as Record<string, unknown> | undefined;
         if (legacy && (!isDpopPrivateJwk(legacy.dpopPrivateJwk) ||
           (legacy.accountId !== undefined && typeof legacy.accountId !== "string"))) throw invalidStore();
-        parsed = { version: 2, ...(legacy ? { auth: {
-          accessToken: "", nativeClientToken: "", sessionId: "", frontendApiUrl: "", publishableKey: "",
+        parsed = { version: 3, ...(legacy ? { auth: {
+          accessToken: "", sessionId: "", browserProfile: "", hostedAppUrl: "",
           jwtTemplate: "", relayUrl: "", expiresAt: new Date(0).toISOString(),
           dpopPrivateJwk: legacy.dpopPrivateJwk as DpopPrivateJwk,
           ...(typeof legacy.accountId === "string" ? { accountId: legacy.accountId } : {}),
         } } : {}) };
         await this.write(parsed);
       }
-      if (parsed.version !== 2 || (parsed.auth !== undefined && !isConnectAuth(parsed.auth))) {
+      if (parsed.version !== 3 || (parsed.auth !== undefined && !isConnectAuth(parsed.auth))) {
         throw invalidStore();
       }
       if (parsed.auth) this.snapshots.set(parsed.auth, this.credentialRevision);
@@ -387,7 +386,7 @@ export class ConnectStore {
         JSON.stringify(previous) !== JSON.stringify(expected))) return false;
       const active = () => { this.assertOwner(); return generation === this.revision; };
       if (!active()) return false;
-      if (!(await this.write({ version: 2, auth }, active))) return false;
+      if (!(await this.write({ version: 3, auth }, active))) return false;
       if (active()) {
         this.credentialRevision += 1;
         this.snapshots.set(auth, this.credentialRevision);
@@ -395,7 +394,7 @@ export class ConnectStore {
       }
       // Restore the retained login if cancellation raced with rename. All readers
       // wait for this serialized mutation, including its restoration.
-      if (previous) await this.write({ version: 2, auth: previous });
+      if (previous) await this.write({ version: 3, auth: previous });
       else await rm(this.filePath, { force: true });
       return false;
     });
@@ -406,14 +405,14 @@ export class ConnectStore {
     return this.mutations.then(() => undefined);
   }
 
-  async stageNative(token: string, frontendApiUrl: string, generation: number): Promise<boolean> {
+  async stageProfile(profile: string, generation: number): Promise<boolean> {
     return this.mutate(async () => {
       if (generation !== this.revision) return false;
       const auth = await this.readCurrent();
       const active = () => generation === this.revision;
-      if (!(await this.write({ version: 2, ...(auth ? { auth } : {}), pendingNative: { token, frontendApiUrl } }, active))) return false;
+      if (!(await this.write({ version: 3, ...(auth ? { auth } : {}), pendingProfile: profile }, active))) return false;
       if (active()) return true;
-      if (auth) await this.write({ version: 2, auth });
+      if (auth) await this.write({ version: 3, auth });
       else await rm(this.filePath, { force: true });
       return false;
     });
@@ -423,7 +422,7 @@ export class ConnectStore {
     return this.mutate(async () => {
       if (generation !== this.revision) return;
       const auth = await this.readCurrent();
-      if (auth) await this.write({ version: 2, auth });
+      if (auth) await this.write({ version: 3, auth });
       else await rm(this.filePath, { force: true });
     });
   }

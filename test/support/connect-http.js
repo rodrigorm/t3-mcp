@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { browserExecutable, operatorLogin, startHostedClerk } from "./hosted-clerk.js";
+export { operatorLogin } from "./hosted-clerk.js";
 
 export const ACCESS_TYPE = "urn:ietf:params:oauth:token-type:access_token";
 export const EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -86,7 +88,7 @@ export function json(response, value, status = 200) {
 export async function http(handler) {
   // Permit the signed large-template storage-race fixture. Proof/credential checks
   // below remain strict; production services keep their own HTTP size limits.
-  const server = createServer({ maxHeaderSize: 32 * 1024 * 1024 }, async (request, response) => {
+  const server = createServer({ maxHeaderSize: 64 * 1024 * 1024 }, async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     try {
@@ -104,82 +106,11 @@ export async function http(handler) {
 
 export async function startConnectControl(environments, options = {}) {
   const state = { accessToken: relaySubjectJwt(), ...options };
-  const clerkRequests = [];
+  const hosted = await startHostedClerk(state, relaySubjectJwt);
+  const clerkRequests = hosted.requests;
   const relayRequests = [];
   const replay = new Set();
   const relayTokens = new Map();
-  const clients = new Map();
-  let clientCount = 0;
-  let rotation = 0;
-  const session = (owner) => ({ id: owner.sessionId, status: state.sessionStatus ?? "active",
-    expire_at: state.sessionExpiresAt ?? Date.now() + 3600_000, user: { id: state.accountId ?? "connect-account-a" },
-    tasks: state.tasks ?? [] });
-  const client = (owner) => ({ id: owner.id, sessions: owner.authenticated ? [session(owner)] : [], last_active_session_id: owner.authenticated ? owner.sessionId : null });
-  const attempt = (owner, status) => ({ id: "si_owned", status,
-    supported_first_factors: state.firstFactors ?? [{ strategy: "email_code", email_address_id: "email_owned" }, { strategy: "password" }],
-    supported_second_factors: state.secondFactors ?? [{ strategy: "totp" }],
-    created_session_id: status === "complete" ? owner.sessionId : null,
-    ...(state.protectCheck ? { protect_check: state.protectCheck } : {}) });
-  const clerk = await http(async (request, response, body) => {
-    const url = new URL(request.url, "http://fixture");
-    clerkRequests.push({ method: request.method, path: url.pathname, query: url.searchParams, headers: request.headers, body });
-    const form = new URLSearchParams(body);
-    assert.equal(url.searchParams.get("_is_native"), "1");
-    assert.equal(url.searchParams.get("__clerk_api_version"), "2026-05-12");
-    assert.equal(request.headers.origin, undefined);
-    assert.equal(request.headers.cookie, undefined);
-    let owner;
-    if (url.pathname === "/v1/client" && request.method === "POST") {
-      const n = ++clientCount;
-      owner = { id: `client_owned_${n}`, sessionId: n === 1 ? "sess_owned" : `sess_owned_${n}`, authenticated: false };
-    } else {
-      const previous = request.headers.authorization?.replace(/^Bearer /, "");
-      owner = clients.get(previous);
-      assert.ok(owner);
-      clients.delete(previous);
-    }
-    const credential = `native-client-secret-${++rotation}`;
-    clients.set(credential, owner);
-    state.nativeClientToken = credential;
-    response.setHeader("authorization", rotation % 2 ? `Bearer ${credential}` : credential);
-    await state.beforeClerk?.(url.pathname, request.method);
-    if (state.clerkStatus) return json(response, { errors: [{ code: "session_not_found", message: credential }] }, state.clerkStatus);
-    const reply = (value) => json(response, { response: value, client: client(owner) });
-    if (url.pathname === "/v1/client") return reply(state.clientResponse ?? client(owner));
-    if (url.pathname === "/v1/client/sign_ins") {
-      assert.equal(form.get("identifier"), "operator@example.test");
-      return reply(attempt(owner, state.signInStatus ?? "needs_first_factor"));
-    }
-    if (url.pathname.endsWith("/prepare_first_factor")) {
-      assert.equal(form.get("strategy"), "email_code");
-      assert.equal(form.get("email_address_id"), "email_owned");
-      return reply(attempt(owner, "needs_first_factor"));
-    }
-    if (url.pathname.endsWith("/attempt_first_factor")) {
-      if (state.rejectVerify) return json(response, { errors: [{ code: "form_code_incorrect", message: credential,
-        long_message: "operator-password reflected" }] }, 422);
-      assert.ok(form.get("code") === "123456" || form.get("password") === "operator-password");
-      const status = state.afterFirstFactor ?? "complete";
-      owner.authenticated = status === "complete";
-      return reply(attempt(owner, status));
-    }
-    if (url.pathname.endsWith("/prepare_second_factor")) return reply(attempt(owner, state.afterFirstFactor));
-    if (url.pathname.endsWith("/attempt_second_factor")) {
-      assert.equal(form.get("code"), "654321");
-      owner.authenticated = true;
-      return reply(attempt(owner, "complete"));
-    }
-    if (url.pathname.endsWith("/end")) { owner.authenticated = false; return reply({ ...session(owner), status: "ended" }); }
-    if (url.pathname.endsWith("/tokens/t3-relay")) {
-      assert.ok(owner.authenticated);
-      assert.equal(body, "");
-      if (state.templateLifetime) state.accessToken = relaySubjectJwt("t3-code-relay", state.accountId ?? "connect-account-a", state.templateLifetime);
-      // Template tokens are a direct { jwt } response in the public OpenAPI.
-      return json(response, Object.hasOwn(state, "templateResponse") ? state.templateResponse : { jwt: state.accessToken });
-    }
-    if (url.pathname.startsWith(`/v1/client/sessions/${owner.sessionId}`)) { assert.ok(owner.authenticated); return reply(state.sessionResponse ?? session(owner)); }
-    return json(response, {}, 404);
-  });
   const endpoint = (environment) => ({ httpBaseUrl: environment.baseUrl,
     wsBaseUrl: environment.baseUrl.replace(/^http/, "ws"), providerKind: "cloudflare_tunnel" });
   const relay = await http(async (request, response, body) => {
@@ -235,10 +166,10 @@ export async function startConnectControl(environments, options = {}) {
     }
     json(response, { code: "not_found" }, 404);
   });
-  return { state, clerkRequests, relayRequests,
-    env: { T3_MCP_CONNECT_RELAY_URL: relay.baseUrl, T3_MCP_CONNECT_FRONTEND_API_URL: clerk.baseUrl,
-    T3_MCP_CONNECT_CALLBACK_PORT: "0" },
-  close: async () => { await clerk.close(); await relay.close(); } };
+  return { state, hosted, clerkRequests, relayRequests,
+    env: { T3_MCP_CONNECT_RELAY_URL: relay.baseUrl, T3_MCP_CONNECT_HOSTED_APP_URL: hosted.appUrl,
+      T3_MCP_CONNECT_BROWSER_EXECUTABLE: await browserExecutable() },
+    close: async () => { await hosted.close(); await relay.close(); } };
 }
 
 export async function startConnectEnvironment(id, options = {}) {
@@ -361,20 +292,19 @@ export async function login(client, control) {
   const auth = success(await call(client, "connect_authenticate")).authentication;
   assert.equal(auth.status, "pending");
   await operatorLogin(auth.authorizationUrl);
-  assert.equal(success(await call(client, "connect_authenticate", { action: "status" })).authentication.status, "authenticated");
+  await waitAuthentication(client);
 }
 
-export async function operatorPost(authorizationUrl, action, fields = {}, headers = {}) {
-  const url = new URL(authorizationUrl);
-  return fetch(`${url.origin}/login`, { method: "POST", headers: { origin: url.origin,
-    "content-type": "application/x-www-form-urlencoded", ...headers },
-    body: new URLSearchParams({ capability: url.hash.slice(1), action, ...fields }) });
-}
-export async function operatorLogin(url) {
-  assert.equal((await operatorPost(url, "identify", { identifier: "operator@example.test" })).status, 200);
-  const response = await operatorPost(url, "verify", { code: "123456" });
-  assert.equal(response.status, 200);
-  return response;
+export async function waitAuthentication(client) {
+  const deadline = Date.now() + 15_000;
+  let status;
+  do {
+    status = success(await call(client, "connect_authenticate", { action: "status" })).authentication;
+    if (status.status !== "pending") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  assert.equal(status.status, "authenticated", status.error?.message);
+  return status;
 }
 
 export async function fixture(t, environments = [], options = {}) {
@@ -395,6 +325,6 @@ export async function fixture(t, environments = [], options = {}) {
     const client = new Client({ name: "connect-http-test", version: "1.0.0" });
     await client.connect(transport);
     clients.push(client);
-    return { client, stderr: () => stderr };
+    return { client, stderr: () => stderr, pid: () => transport.pid };
   } };
 }

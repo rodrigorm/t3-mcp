@@ -34,6 +34,8 @@ const connectAuthSchema = z.object({
   status: z.enum(["signed_out", "pending", "authenticated", "failed", "cancelled"]),
   authorizationUrl: z.string().optional(),
   expiresAt: z.string().optional(),
+  browserOpened: z.boolean().optional(),
+  message: z.string().optional(),
   error: errorSchema.optional(),
 });
 const connectAuthResultSchema = z.object({ authentication: connectAuthSchema });
@@ -247,7 +249,7 @@ export function createServer(connector: EnvironmentConnector): McpServer {
     "connect_authenticate",
     {
       description:
-        "Start, inspect, or cancel Desktop-native T3 Connect authentication. Open the local browser URL; enter identifiers, passwords and codes only in that page.",
+        "Start, inspect, or cancel T3 Connect sign-in in a connector-owned browser using the official hosted Clerk UI. Complete any offered provider or verification method in that browser; never pass credentials to this tool.",
       inputSchema: connectAuthInputSchema,
       outputSchema: connectAuthResultSchema,
       annotations: { destructiveHint: false, idempotentHint: false, readOnlyHint: false },

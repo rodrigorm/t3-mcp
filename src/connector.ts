@@ -300,6 +300,8 @@ export class EnvironmentConnector {
     return this.connect.authenticate(input.action);
   }
 
+  async close(): Promise<void> { await this.connect.shutdown(); }
+
   async listConnectEnvironments(): Promise<readonly ConnectEnvironment[]> {
     return this.connect.listEnvironments();
   }

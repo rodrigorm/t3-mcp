@@ -10,8 +10,9 @@ private bot convention. Direct pairing is always available; T3 Connect is an opt
 path. Select the operator's exact environment and project; deployment-specific defaults are not
 part of this skill.
 
-Connect is EXPERIMENTAL and uses Desktop-native Clerk authentication. The operator enters
-identifiers, passwords and verification codes only in the returned local browser page.
+Connect is EXPERIMENTAL and opens the actual official Clerk UI in an owned browser profile.
+Any sign-in method offered by that UI is valid. The operator alone completes providers,
+passwords, verification, passkeys and challenges in the window opened by the connector.
 Keep credentials in the connector's private exchanges. On `upstream_incompatible`, report
 the sanitized error and consult [the auth contract](../../docs/connect-auth-contract.md).
 
@@ -71,9 +72,11 @@ registration; select an environment explicitly, then register or attach it befor
 ## Register or attach Connect access
 
 1. For operator-requested Connect access, start `connect_authenticate`, have the operator open
-   its loopback authorization URL on the connector host, and poll with `action=status` until
+   the connector-owned browser window at the hosted app, and poll with `action=status` until
    `authenticated`. On failed or cancelled status, report the sanitized code and stop. Discovery
-   and registration require authentication; an existing valid environment session does not.
+    and registration require authentication; an existing valid environment session does not.
+    `browserOpened=true` confirms the window was opened. The returned public URL is guidance,
+    not a login transfer link. Keep the window open until MCP confirms authentication.
 2. Call `list_environments` and `list_connect_environments`. Discovery must leave saved
    registrations unchanged. Use only the operator's explicitly selected discovered `id`.
 3. For a new registration, pass that `id` as `environmentId` to `register_connect_environment`.

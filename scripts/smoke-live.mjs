@@ -83,10 +83,11 @@ async function expectError(client, name, args, code) {
 async function authenticate(client, waitMs, pollMs) {
   let auth = (await call(client, "connect_authenticate")).authentication;
   if (auth?.status === "pending") {
-    // The only non-summary output is the connector-owned loopback login URL.
+    // The only non-summary output is the public hosted root opened in the owned browser.
     const url = new URL(auth.authorizationUrl);
-    requireThat(url.protocol === "http:" && url.hostname === "127.0.0.1" && url.port && url.pathname === "/login" && !url.username &&
-      !url.password && !url.search && /^#[A-Za-z0-9_-]{43}$/.test(url.hash), "unsafe_authorization_url");
+    const expected = new URL(setting("T3_MCP_CONNECT_HOSTED_APP_URL") || "https://app.t3.codes");
+    requireThat(url.origin === expected.origin && url.pathname === "/" && !url.username &&
+      !url.password && !url.search && !url.hash && auth.browserOpened === true, "unsafe_authorization_url");
     console.log(`authorization_url=${url}`);
   }
   const deadline = Date.now() + waitMs;
@@ -228,7 +229,7 @@ export async function runSmoke(mode = "direct") {
     if (mode === "connect") {
       await client.close();
       await connect();
-      requireThat((await call(client, "connect_authenticate", { action: "status" })).authentication?.status === "authenticated", "restart_native_login_invalid");
+      requireThat((await call(client, "connect_authenticate", { action: "status" })).authentication?.status === "authenticated", "restart_owned_login_invalid");
       await call(client, "list_connect_environments");
       await assertIds(client, [environmentId, sanityId]);
       await projects(client, environmentId, projectId);

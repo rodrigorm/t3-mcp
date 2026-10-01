@@ -1,11 +1,12 @@
+import { randomUUID } from "node:crypto";
+
 import { ConnectorError } from "./errors.js";
 import { createDpopProof, dpopThumbprint, generateDpopKey } from "./dpop.js";
 import { ConnectStore, type ConnectAuth } from "./storage.js";
 import { safePayload } from "./secrets.js";
 import { pairConnectEnvironment } from "./upstream.js";
 import { parseEndpoint } from "./url.js";
-import { NativeClerk, type NativeConfig, type LoginView } from "./native-clerk.js";
-import { localLogin, type LocalLogin } from "./local-login.js";
+import { BrowserProfiles, type BrowserAuthConfig } from "./browser-auth.js";
 import type { DpopPrivateJwk, PairingResult } from "./types.js";
 
 const AUTH_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -17,6 +18,8 @@ export interface PublicConnectAuth {
   readonly status: ConnectAuthState;
   readonly authorizationUrl?: string;
   readonly expiresAt?: string;
+  readonly browserOpened?: boolean;
+  readonly message?: string;
   readonly error?: { readonly code: string; readonly message: string };
 }
 export interface ConnectEnvironment {
@@ -25,17 +28,18 @@ export interface ConnectEnvironment {
   readonly endpoint: string;
   readonly linkedAt: string;
 }
-interface ConnectConfig extends NativeConfig {
+interface ConnectConfig extends BrowserAuthConfig {
   readonly relayClientId: "t3-web" | "t3-mobile";
-  readonly callbackPort: number;
 }
 interface PendingAuthorization {
-  readonly ui: LocalLogin;
+  readonly profile: string;
+  readonly settings: ConnectConfig;
   readonly expiresAt: string;
   readonly key: DpopPrivateJwk;
   readonly timer: NodeJS.Timeout;
   readonly generation: number;
-  readonly clerk: NativeClerk;
+  ready: boolean;
+  poll?: Promise<PublicConnectAuth>;
 }
 
 function firstSetting(...names: string[]): string | undefined {
@@ -52,31 +56,24 @@ function normalizedUrl(value: string, allowLoopbackHttp: boolean): string {
   } catch { throw new ConnectorError("connect_not_configured", "The T3 Connect endpoint configuration is invalid."); }
 }
 function config(): ConnectConfig {
-  const port = firstSetting("T3_MCP_CONNECT_CALLBACK_PORT") ?? "0";
-  if (!/^\d{1,5}$/.test(port) || Number(port) > 65535) throw new ConnectorError("connect_not_configured", "The local Connect UI port configuration is invalid.");
-  const publishableKey = firstSetting("T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY", "T3_MCP_CLERK_PUBLISHABLE_KEY", "T3CODE_CLERK_PUBLISHABLE_KEY") ?? "pk_live_Y2xlcmsudDMuY29kZXMk";
-  let frontendHost: string;
-  try {
-    if (!/^pk_(live|test)_/.test(publishableKey)) throw new Error();
-    frontendHost = Buffer.from(publishableKey.split("_").slice(2).join("_"), "base64").toString("utf8");
-    if (!/^[a-zA-Z0-9.-]+\$$/.test(frontendHost)) throw new Error();
-  } catch { throw new ConnectorError("connect_not_configured", "The Clerk publishable key configuration is invalid."); }
   const jwtTemplate = firstSetting("T3_MCP_CONNECT_CLERK_JWT_TEMPLATE", "T3CODE_CLERK_JWT_TEMPLATE") ?? "t3-relay";
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(jwtTemplate)) throw new ConnectorError("connect_not_configured", "The Clerk JWT template configuration is invalid.");
   return {
-    publishableKey, jwtTemplate,
-    frontendApiUrl: normalizedUrl(firstSetting("T3_MCP_CONNECT_FRONTEND_API_URL") ?? `https://${frontendHost.slice(0, -1)}`, true),
+    jwtTemplate,
+    hostedAppUrl: normalizedUrl(firstSetting("T3_MCP_CONNECT_HOSTED_APP_URL", "T3CODE_HOSTED_APP_URL") ?? "https://app.t3.codes", true),
     relayUrl: normalizedUrl(firstSetting("T3_MCP_CONNECT_RELAY_URL", "T3_MCP_RELAY_URL", "T3CODE_RELAY_URL") ?? "https://relay.t3.codes", true),
     relayClientId: firstSetting("T3_MCP_RELAY_CLIENT_ID") === "t3-mobile" ? "t3-mobile" : "t3-web",
-    callbackPort: Number(port),
   };
 }
-function associated(auth: ConnectAuth, settings: NativeConfig): boolean {
-  return ["frontendApiUrl", "publishableKey", "jwtTemplate", "relayUrl"].every((key) =>
-    auth[key as keyof NativeConfig] === settings[key as keyof NativeConfig]);
+function associated(auth: ConnectAuth, settings: BrowserAuthConfig): boolean {
+  return ["hostedAppUrl", "jwtTemplate", "relayUrl"].every((key) =>
+    auth[key as keyof BrowserAuthConfig] === settings[key as keyof BrowserAuthConfig]);
 }
 function publicAuth(status: ConnectAuthState, pending?: PendingAuthorization, error?: { code: string; message: string }): PublicConnectAuth {
-  return { status, ...(pending ? { authorizationUrl: pending.ui.authorizationUrl, expiresAt: pending.expiresAt } : {}), ...(error ? { error } : {}) };
+  return { status, ...(pending ? { authorizationUrl: pending.settings.hostedAppUrl, expiresAt: pending.expiresAt,
+    browserOpened: pending.ready, message: pending.ready
+      ? "A connector-owned browser was opened. Complete T3 Connect sign-in using any option offered by the official UI."
+      : "The connector-owned browser is opening." } : {}), ...(error ? { error } : {}) };
 }
 async function responseJson(response: Response): Promise<unknown> {
   try { return await response.json(); } catch { throw new ConnectorError("upstream_incompatible", "T3 Connect returned invalid JSON."); }
@@ -118,10 +115,11 @@ export class ConnectManager {
   private lifecycle = 0;
   private starting: Promise<PublicConnectAuth> | undefined;
   private readonly secrets = new Set<string>();
-  private validatedSession: string | undefined;
+  private validatedProfile: string | undefined;
+  private readonly browser: BrowserProfiles;
   private refreshing: { readonly generation: number; readonly token: Promise<ConnectAuth> } | undefined;
 
-  constructor(private readonly store: ConnectStore) {}
+  constructor(private readonly store: ConnectStore) { this.browser = new BrowserProfiles(store.directory); }
 
   async authenticate(action: "start" | "status" | "cancel" = "start"): Promise<PublicConnectAuth> {
     if (action === "status") return this.status();
@@ -148,73 +146,71 @@ export class ConnectManager {
     const settings = config();
     const generation = this.store.generation;
     const assertActive = () => { this.requireLifecycle(lifecycle); this.requireGeneration(generation); };
-    const clerk = new NativeClerk(settings, "", async (token) => {
-      assertActive(); this.secrets.add(token);
-      if (!await this.store.stageNative(token, settings.frontendApiUrl, generation)) this.requireGeneration(-1);
-    }, assertActive);
-    const ui = await localLogin(settings.callbackPort, async (fields) => {
-      assertActive();
-      const pending = this.pending;
-      if (!pending || pending.clerk !== clerk) this.requireGeneration(-1);
-      if (fields.get("action") === "cancel") { await this.cancel(); return { step: "cancelled" }; }
-      try {
-        let view: LoginView;
-        switch (fields.get("action")) {
-          case "identify": {
-            const identifier = fields.get("identifier")?.trim();
-            if (!identifier || identifier.length > 1024) throw new ConnectorError("invalid_input", "Enter an account identifier in this browser.");
-            this.secrets.add(identifier);
-            view = await clerk.identify(identifier); break;
-          }
-          case "choose": view = await clerk.choose(fields.get("strategy") ?? ""); break;
-          case "verify": {
-            const value = fields.get("password") ?? fields.get("code");
-            if (!value || value.length > 1024) throw new ConnectorError("invalid_input", "Enter the requested verification in this browser.");
-            this.secrets.add(value);
-            view = await clerk.verify(value); break;
-          }
-          default: throw new ConnectorError("invalid_input", "Unsupported local login action.");
-        }
-        assertActive();
-        if (view.step === "complete") await this.completeLogin(pending!, settings);
-        return view;
-      } catch (error) {
-        if (error instanceof ConnectorError && this.pending === pending) {
-          this.last = publicAuth("pending", pending, { code: error.code, message: error.message });
-          // Input errors remain retryable. Actual lifecycle/ownership failures end the flow.
-          if (["connect_auth_expired", "connect_account_conflict", "upstream_incompatible"].includes(error.code)) await this.finishPending(error, pending);
-        }
-        throw error;
-      }
-    }, assertActive);
-    if (lifecycle !== this.lifecycle) { ui.close(); this.requireLifecycle(lifecycle); }
-    const pending: PendingAuthorization = { ui, clerk, generation, key: generateDpopKey(),
+    const pending: PendingAuthorization = { profile: randomUUID(), settings, generation, key: generateDpopKey(), ready: false,
       expiresAt: new Date(Date.now() + AUTH_TIMEOUT_MS).toISOString(),
       timer: setTimeout(() => { void this.finishPending(new ConnectorError("connect_auth_expired", "T3 Connect authorization expired; authenticate again."), pending); }, AUTH_TIMEOUT_MS) };
     this.pending = pending;
-    this.last = publicAuth("pending", pending);
+    try {
+      if (!await this.store.stageProfile(pending.profile, generation)) this.requireGeneration(-1);
+      await this.browser.open(pending.profile, settings, true, assertActive);
+      assertActive();
+      pending.ready = true;
+      this.last = publicAuth("pending", pending);
+    } catch (error) {
+      if (this.pending === pending && error instanceof ConnectorError) await this.finishPending(error, pending);
+      else await this.browser.discard(pending.profile);
+      throw error;
+    }
     return this.last;
   }
 
-  private async completeLogin(pending: PendingAuthorization, settings: ConnectConfig): Promise<void> {
-    const active = () => { this.requireGeneration(pending.generation); if (this.pending !== pending) this.requireGeneration(-1); };
-    const owner = await pending.clerk.ownedSession(); active();
-    const existing = await this.store.read(); active();
-    if (existing && (!existing.accountId || existing.accountId !== owner.accountId)) {
-      throw new ConnectorError("connect_account_conflict", "A different T3 Connect account is retained; sign out before switching accounts.");
+  private async pollPending(pending: PendingAuthorization): Promise<PublicConnectAuth> {
+    if (!pending.ready) return publicAuth("pending", pending);
+    if (pending.poll) return pending.poll;
+    const poll = this.completeLogin(pending);
+    pending.poll = poll;
+    try { return await poll; } finally { if (pending.poll === poll) pending.poll = undefined; }
+  }
+
+  private async completeLogin(pending: PendingAuthorization): Promise<PublicConnectAuth> {
+    let flushing = false;
+    const active = () => {
+      this.requireGeneration(pending.generation);
+      if (this.pending !== pending) this.requireGeneration(-1);
+      if (!flushing) this.browser.assertOpen(pending.profile);
+    };
+    try {
+      const grant = await this.browser.read(pending.profile, pending.settings, active);
+      active();
+      if (!grant) return publicAuth("pending", pending);
+      const existing = await this.store.read(); active();
+      if (existing && (!existing.accountId || existing.accountId !== grant.accountId)) {
+        throw new ConnectorError("connect_account_conflict", "A different T3 Connect account is retained; sign out before switching accounts.");
+      }
+      this.secrets.add(grant.accessToken);
+      const { hostedAppUrl, jwtTemplate, relayUrl } = pending.settings;
+      const auth: ConnectAuth = { hostedAppUrl, jwtTemplate, relayUrl, ...grant,
+        browserProfile: pending.profile, dpopPrivateJwk: pending.key };
+      await this.discover(pending.settings, auth, active); active();
+      flushing = true;
+      await this.browser.close(pending.profile); active();
+      if (!await this.store.replace(auth, pending.generation)) this.requireGeneration(-1);
+      active();
+      this.validatedProfile = auth.browserProfile;
+      this.stopPending(); this.last = { status: "authenticated" };
+      if (existing?.browserProfile && existing.browserProfile !== auth.browserProfile) await this.browser.discard(existing.browserProfile);
+      return this.last;
+    } catch (error) {
+      if (error instanceof ConnectorError && this.pending === pending) {
+        await this.finishPending(error, pending);
+        return this.last;
+      }
+      throw error;
     }
-    const token = await pending.clerk.template(owner.sessionId, owner.accountId); active();
-    this.secrets.add(token.accessToken);
-    const { frontendApiUrl, publishableKey, jwtTemplate, relayUrl } = settings;
-    const auth: ConnectAuth = { frontendApiUrl, publishableKey, jwtTemplate, relayUrl, ...owner, ...token,
-      nativeClientToken: pending.clerk.token, dpopPrivateJwk: pending.key };
-    await this.discover(settings, auth, active); active();
-    if (!await this.store.replace(auth, pending.generation)) this.requireGeneration(-1);
-    active(); this.validatedSession = auth.sessionId; this.stopPending(); this.last = { status: "authenticated" };
   }
 
   async status(): Promise<PublicConnectAuth> {
-    if (this.pending) return this.last.status === "pending" ? this.last : publicAuth("pending", this.pending);
+    if (this.pending) return this.pollPending(this.pending);
     const existing = await this.store.read();
     if (!existing) return this.last;
     if (this.last.status === "failed") return this.last;
@@ -228,10 +224,15 @@ export class ConnectManager {
   async cancel(): Promise<PublicConnectAuth> {
     this.lifecycle += 1;
     const drained = this.store.invalidateWrites();
+    const pending = this.pending;
     this.starting = undefined; this.stopPending();
     const cancelled = publicAuth("cancelled", undefined, { code: "connect_auth_cancelled", message: "T3 Connect authorization was cancelled." });
     this.last = cancelled;
     const generation = this.store.generation;
+    // Capture the browsers now, before another start can create a newer profile.
+    const closing = this.browser.closeAll();
+    await closing;
+    if (pending) await this.browser.discard(pending.profile);
     await drained; await this.store.discardPending(generation);
     return cancelled;
   }
@@ -241,21 +242,23 @@ export class ConnectManager {
     const cancelled = this.cancel();
     const lifecycle = this.lifecycle;
     const clearing = this.store.clear();
-    this.validatedSession = undefined;
+    const generation = this.store.generation;
+    this.validatedProfile = undefined;
     this.secrets.clear();
     const existing = await reading;
     await cancelled;
     const signedOut = await clearing;
     if (lifecycle === this.lifecycle && !this.pending) this.last = { status: "signed_out" };
-    // Only end the session we own, with its own native credential/config association.
-    if (existing?.nativeClientToken && existing.sessionId) {
+    // The SDK signs out only this connector's session; environment sessions are independent.
+    if (existing?.browserProfile) {
       try {
         if (associated(existing, config())) {
-          await new NativeClerk(existing, existing.nativeClientToken, async () => undefined, () => undefined).end(existing.sessionId);
-        }
+          await this.browser.signOut(existing.browserProfile, existing.sessionId, existing);
+        } else await this.browser.discard(existing.browserProfile);
       }
-      catch { /* Local logout succeeds even when the remote session is already revoked/unreachable. */ }
+      catch { await this.browser.discard(existing.browserProfile); }
     }
+    await this.browser.discardAll(() => this.lifecycle === lifecycle && this.store.generation === generation);
     return { signedOut };
   }
 
@@ -290,35 +293,32 @@ export class ConnectManager {
   }
 
   private async loadAuthToken(generation: number): Promise<ConnectAuth> {
-    let auth = await this.store.read(); this.requireGeneration(generation);
+    const auth = await this.store.read(); this.requireGeneration(generation);
     const settings = config();
-    if (!auth?.nativeClientToken || !auth.sessionId || !auth.accountId || !associated(auth, settings)) throw new ConnectorError("connect_auth_expired", "Desktop native reauthentication is required; start the local browser login.");
+    if (!auth?.browserProfile || !auth.sessionId || !auth.accountId || !associated(auth, settings)) throw new ConnectorError("connect_auth_expired", "Connect reauthentication is required; start the owned browser login.");
     this.remember(auth);
-    if (this.validatedSession === auth.sessionId && Date.parse(auth.expiresAt) > Date.now() + 5_000) return auth;
+    if (this.validatedProfile === auth.browserProfile && Date.parse(auth.expiresAt) > Date.now() + 5_000) return auth;
     const active = () => this.requireGeneration(generation);
-    const clerk = new NativeClerk(settings, auth.nativeClientToken, async (nativeClientToken) => {
-      active(); this.secrets.add(nativeClientToken);
-      const rotated = { ...auth!, nativeClientToken };
-      if (!await this.store.replace(rotated, generation, auth!)) this.requireGeneration(-1);
-      auth = rotated;
-    }, active);
     try {
-      await clerk.ownedSession(auth.sessionId, auth.accountId); active();
-      const token = await clerk.template(auth.sessionId, auth.accountId); active();
-      this.secrets.add(token.accessToken);
-      const refreshed = { ...auth, ...token, nativeClientToken: clerk.token };
+      await this.browser.open(auth.browserProfile, settings, false, active);
+      const grant = await this.browser.read(auth.browserProfile, settings, active); active();
+      if (!grant) throw new ConnectorError("connect_auth_expired", "The owned Clerk browser session expired or needs operator sign-in. Start authentication again.");
+      if (grant.accountId !== auth.accountId) throw new ConnectorError("connect_account_conflict", "A different T3 Connect account was returned; sign out before switching accounts.");
+      this.secrets.add(grant.accessToken);
+      const refreshed = { ...auth, ...grant };
       await this.discover(settings, refreshed, active); active();
       if (!await this.store.replace(refreshed, generation, auth)) this.requireGeneration(-1);
-      this.validatedSession = refreshed.sessionId;
+      await this.browser.close(auth.browserProfile); active();
+      this.validatedProfile = refreshed.browserProfile;
       this.last = { status: "authenticated" }; return refreshed;
     } catch (error) {
       if (error instanceof ConnectorError && error.code === "connect_auth_expired") await this.invalidateAuth(auth, generation);
       throw error;
-    }
+    } finally { await this.browser.close(auth.browserProfile); }
   }
 
   private async invalidateAuth(auth: ConnectAuth, generation: number): Promise<void> {
-    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), nativeClientToken: "", accessToken: "" }, generation, auth);
+    const saved = await this.store.replace({ ...auth, expiresAt: new Date(0).toISOString(), accessToken: "" }, generation, auth);
     this.requireGeneration(generation);
     if (saved) this.last = publicAuth("failed", undefined, { code: "connect_auth_expired", message: "T3 Connect authentication expired; authenticate again." });
   }
@@ -331,17 +331,29 @@ export class ConnectManager {
   }
   private stopPending(): void {
     const pending = this.pending; this.pending = undefined;
-    if (pending) { clearTimeout(pending.timer); pending.ui.close(); }
+    if (pending) clearTimeout(pending.timer);
   }
   private async finishPending(error: ConnectorError, expected: PendingAuthorization | undefined): Promise<void> {
     if (!expected || this.pending !== expected) return;
     const drained = this.store.invalidateWrites(); this.stopPending();
     const generation = this.store.generation;
     this.last = publicAuth("failed", undefined, { code: error.code, message: error.message });
+    await this.browser.discard(expected.profile);
     await drained; await this.store.discardPending(generation);
   }
   private remember(auth: ConnectAuth): void {
-    for (const secret of [auth.accessToken, auth.nativeClientToken, auth.dpopPrivateJwk.d]) if (secret) this.secrets.add(secret);
+    for (const secret of [auth.accessToken, auth.dpopPrivateJwk.d]) if (secret) this.secrets.add(secret);
+  }
+
+  async shutdown(): Promise<void> {
+    this.lifecycle += 1;
+    await this.store.invalidateWrites();
+    const pending = this.pending; this.stopPending();
+    await this.browser.closeAll();
+    if (pending) {
+      await this.browser.discard(pending.profile);
+      await this.store.discardPending();
+    }
   }
 
   async connectEnvironment(environmentId: string): Promise<{ readonly environment: ConnectEnvironment; readonly pairing: PairingResult;
