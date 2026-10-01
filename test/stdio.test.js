@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { operatorLogin, startConnectControl, verifyDpop, waitAuthentication } from "./support/connect-http.js";
 
 const connectorPath = path.join(process.cwd(), "dist", "index.js");
 
@@ -61,9 +62,21 @@ async function startEnvironment({
   projects = [],
   orchestration = {},
   dispatch,
+  dpopGrants = new Map(),
 } = {}) {
   const requests = [];
   const tokens = new Map();
+  const proofBindings = new Map();
+  const replay = new Set();
+  const tokenFromRequest = (request) => {
+    const match = request.headers.authorization?.match(/^(Bearer|DPoP) (.+)$/);
+    if (!match || tokens.get(match[2]) !== match[1]) return undefined;
+    if (match[1] === "DPoP") {
+      try { verifyDpop(request, server.baseUrl, replay, { token: match[2], thumbprint: proofBindings.get(match[2]) }); }
+      catch { return undefined; }
+    }
+    return match[2];
+  };
   const server = await startHttpServer(async (request, response) => {
     const body = await readBody(request);
     requests.push({ method: request.method, path: request.url, headers: request.headers, body });
@@ -87,7 +100,9 @@ async function startEnvironment({
       const form = new URLSearchParams(body);
       const grant = form.get("subject_token");
       const token = grants?.get(grant);
-      if (!token) {
+      const dpopToken = dpopGrants.get(grant);
+      const accessToken = dpopToken ?? token;
+      if (!accessToken || (dpopToken && !request.headers.dpop)) {
         return jsonResponse(response, 401, {
           code: "auth_invalid",
           reason: "invalid_credential",
@@ -95,19 +110,25 @@ async function startEnvironment({
           access_token: "secret-error-token",
         });
       }
-      tokens.set(token, true);
+      if (dpopToken) {
+        try { verifyDpop(request, server.baseUrl, replay, { thumbprint: proofBindings.get(grant) }); }
+        catch { return jsonResponse(response, 401, { code: "invalid_proof" }); }
+        proofBindings.set(accessToken, proofBindings.get(grant));
+        dpopGrants.delete(grant);
+      }
+      tokens.set(accessToken, dpopToken ? "DPoP" : "Bearer");
       return jsonResponse(response, 200, {
-        access_token: token,
+        access_token: accessToken,
         issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
-        token_type: "Bearer",
+        token_type: dpopToken ? "DPoP" : "Bearer",
         expires_in: 3600,
         scope: "orchestration:read orchestration:operate",
       });
     }
 
     if (request.method === "GET" && request.url === "/api/auth/session") {
-      const token = request.headers.authorization?.replace(/^Bearer /, "");
-      if (!token || !tokens.has(token)) {
+      const token = tokenFromRequest(request);
+      if (!token) {
         return jsonResponse(response, 401, { code: "auth_invalid", token: "secret-session-token" });
       }
       return jsonResponse(response, 200, {
@@ -115,18 +136,17 @@ async function startEnvironment({
         auth: {
           policy: "loopback-browser",
           bootstrapMethods: ["one-time-token"],
-          sessionMethods: ["bearer-access-token"],
+          sessionMethods: [tokens.get(token) === "DPoP" ? "dpop-access-token" : "bearer-access-token"],
           sessionCookieName: "t3_session",
         },
         scopes: ["orchestration:read", "orchestration:operate"],
-        sessionMethod: "bearer-access-token",
+        sessionMethod: tokens.get(token) === "DPoP" ? "dpop-access-token" : "bearer-access-token",
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       });
     }
 
     if (request.method === "GET" && request.url?.startsWith("/api/orchestration/")) {
-      const token = request.headers.authorization?.replace(/^Bearer /, "");
-      if (!token || !tokens.has(token)) {
+      if (!tokenFromRequest(request)) {
         return jsonResponse(response, 401, { code: "auth_invalid", token: "secret-session-token" });
       }
       if (orchestration.status) {
@@ -159,8 +179,7 @@ async function startEnvironment({
     }
 
     if (request.method === "POST" && request.url === "/api/orchestration/dispatch") {
-      const token = request.headers.authorization?.replace(/^Bearer /, "");
-      if (!token || !tokens.has(token)) {
+      if (!tokenFromRequest(request)) {
         return jsonResponse(response, 401, { code: "auth_invalid", token: "secret-session-token" });
       }
       if (orchestration.status) {
@@ -186,15 +205,20 @@ async function startEnvironment({
     response.writeHead(404);
     response.end();
   });
-  return { ...server, requests, tokens };
+  return { ...server, requests, tokens, bindBootstrap: (grant, jkt) => proofBindings.set(grant, jkt) };
 }
 
-async function connectClient(stateDirectory) {
+async function connectClient(stateDirectory, extraEnvironment = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [connectorPath],
     cwd: process.cwd(),
-    env: { ...process.env, T3_MCP_STATE_DIR: stateDirectory, NODE_NO_WARNINGS: "1" },
+    env: {
+      ...process.env,
+      T3_MCP_STATE_DIR: stateDirectory,
+      NODE_NO_WARNINGS: "1",
+      ...extraEnvironment,
+    },
     stderr: "ignore",
   });
   const client = new Client({ name: "stdio-test-client", version: "1.0.0" });
@@ -321,11 +345,17 @@ test("pairs, persists, re-pairs safely, and lists through the public MCP seam", 
       tools.tools.map((tool) => tool.name).sort(),
       [
         "add_environment",
+        "attach_connect_environment",
+        "connect_authenticate",
         "continue_turn",
         "get_thread",
+        "list_connect_environments",
         "list_environments",
         "list_projects",
+        "register_connect_environment",
+        "sign_out_connect",
         "start_turn",
+        "unregister_environment",
       ],
     );
     assert.ok(tools.tools.find((tool) => tool.name === "add_environment").inputSchema.properties.pairingUrl);
@@ -416,6 +446,121 @@ test("pairs, persists, re-pairs safely, and lists through the public MCP seam", 
   } finally {
     await closeClient(client);
     await closeClient(restartedClient);
+    await environmentA.close();
+    await environmentB.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("authenticates with Connect, discovers without registering, attaches, registers, and unregisters safely", async () => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "t3-mcp-connect-"));
+  const environmentA = await startEnvironment({
+    id: "environment-a",
+    label: "Alpha",
+    grants: new Map([["direct-grant-a", "direct-token-a"]]),
+    dpopGrants: new Map([["connect-grant-a", "connect-token-a"]]),
+    projects: [{ id: "project-a", title: "Alpha project" }],
+  });
+  const environmentB = await startEnvironment({
+    id: "environment-b",
+    label: "Beta",
+    dpopGrants: new Map([["connect-grant-b", "connect-token-b"]]),
+    projects: [{ id: "project-b", title: "Beta project" }],
+  });
+  const connect = await startConnectControl([
+    { ...environmentA, id: "environment-a", label: "Alpha Connect", connectGrant: "connect-grant-a" },
+    { ...environmentB, id: "environment-b", label: "Beta Connect", connectGrant: "connect-grant-b" },
+  ]);
+  let client;
+  let restartedClient;
+  try {
+    client = await connectClient(stateDirectory, connect.env);
+    const direct = await client.callTool({
+      name: "add_environment",
+      arguments: { endpoint: environmentA.baseUrl, grant: "direct-grant-a", label: "Alpha direct" },
+    });
+    assert.equal(content(direct).environment.id, "environment-a");
+
+    const started = await client.callTool({ name: "connect_authenticate", arguments: {} });
+    const authorizationUrl = content(started).authentication.authorizationUrl;
+    assert.equal(content(started).authentication.status, "pending");
+    await operatorLogin(authorizationUrl);
+    await waitAuthentication(client);
+    assert.equal(connect.clerkRequests[0].path, "/v1/client");
+    assert.ok(connect.clerkRequests.some((request) => request.path.endsWith("/tokens/t3-relay")));
+
+    const discovered = await client.callTool({ name: "list_connect_environments", arguments: {} });
+    assert.deepEqual(content(discovered).environments.map((environment) => environment.id), ["environment-a", "environment-b"]);
+    assert.deepEqual(
+      content(await client.callTool({ name: "list_environments", arguments: {} })).environments.map((environment) => environment.id),
+      ["environment-a"],
+    );
+
+    const attached = await client.callTool({
+      name: "attach_connect_environment",
+      arguments: { environmentId: "environment-a", targetEnvironmentId: "environment-a", label: "connect-grant-a" },
+    });
+    assert.equal(content(attached).environment.id, "environment-a");
+    assert.equal(content(attached).environment.source, "connect");
+    assert.equal(content(attached).environment.connectAttached, true);
+    assert.equal(JSON.stringify(attached).includes("connect-grant-a"), false);
+
+    const registered = await client.callTool({
+      name: "register_connect_environment",
+      arguments: { environmentId: "environment-b", label: "Beta registered" },
+    });
+    assert.equal(content(registered).environment.id, "environment-b");
+    assert.equal(content(registered).environment.source, "connect");
+    assert.equal(JSON.stringify(registered).includes("connect-grant-b"), false);
+    assert.equal(JSON.stringify(registered).includes("connect-token-b"), false);
+
+    const duplicate = await client.callTool({
+      name: "register_connect_environment",
+      arguments: { environmentId: "environment-a" },
+    });
+    assert.equal(duplicate.isError, true);
+    assert.equal(content(duplicate).error.code, "environment_exists");
+
+    const projects = await client.callTool({ name: "list_projects", arguments: { environmentId: "environment-b" } });
+    assert.deepEqual(content(projects).projects, [{ id: "project-b", name: "Beta project" }]);
+    const dpopRequest = environmentB.requests.find((request) => request.path === "/api/auth/session");
+    assert.match(dpopRequest.headers.authorization, /^DPoP /);
+    assert.ok(dpopRequest.headers.dpop);
+
+    const unregistered = await client.callTool({
+      name: "unregister_environment",
+      arguments: { environmentId: "environment-b" },
+    });
+    assert.deepEqual(content(unregistered), { environmentId: "environment-b", unregistered: true });
+    assert.deepEqual(
+      content(await client.callTool({ name: "list_environments", arguments: {} })).environments.map((environment) => environment.id),
+      ["environment-a"],
+    );
+    assert.deepEqual(content(await client.callTool({ name: "list_connect_environments", arguments: {} })).environments.map((environment) => environment.id), ["environment-a", "environment-b"]);
+
+    const signedOut = await client.callTool({ name: "sign_out_connect", arguments: {} });
+    assert.deepEqual(content(signedOut), { signedOut: true });
+    const connectAfterSignOut = await client.callTool({ name: "list_connect_environments", arguments: {} });
+    assert.equal(connectAfterSignOut.isError, true);
+    assert.equal(content(connectAfterSignOut).error.code, "connect_auth_expired");
+    assert.deepEqual(
+      content(await client.callTool({ name: "list_projects", arguments: { environmentId: "environment-a" } })).projects,
+      [{ id: "project-a", name: "Alpha project" }],
+    );
+
+    await closeClient(client);
+    restartedClient = await connectClient(stateDirectory, connect.env);
+    assert.deepEqual(
+      content(await restartedClient.callTool({ name: "list_environments", arguments: {} })).environments.map((environment) => environment.id),
+      ["environment-a"],
+    );
+    const missing = await restartedClient.callTool({ name: "list_projects", arguments: { environmentId: "environment-b" } });
+    assert.equal(missing.isError, true);
+    assert.equal(content(missing).error.code, "environment_not_found");
+  } finally {
+    await closeClient(client);
+    await closeClient(restartedClient);
+    await connect.close();
     await environmentA.close();
     await environmentB.close();
     await rm(stateDirectory, { recursive: true, force: true });

@@ -18,6 +18,17 @@ export type ConnectorErrorCode =
   | "environment_exists"
   | "environment_not_found"
   | "environment_conflict"
+  | "connect_not_configured"
+  | "connect_auth_pending"
+  | "connect_auth_failed"
+  | "connect_auth_cancelled"
+  | "connect_auth_expired"
+  | "connect_account_conflict"
+  | "connect_permission_denied"
+  | "connect_unavailable"
+  | "connect_environment_not_found"
+  | "connect_identity_mismatch"
+  | "connect_endpoint_invalid"
   | "storage_error"
   | "internal_error";
 

@@ -4,6 +4,17 @@ export const DEFAULT_THREAD_HISTORY_TURN_LIMIT = 20;
 export const MAX_THREAD_HISTORY_TURN_LIMIT = 100;
 export const MAX_START_TURN_PROMPT_LENGTH = 120_000;
 
+export interface DpopPublicJwk {
+  readonly kty: "EC";
+  readonly crv: "P-256";
+  readonly x: string;
+  readonly y: string;
+}
+
+export interface DpopPrivateJwk extends DpopPublicJwk {
+  readonly d: string;
+}
+
 export interface EnvironmentDescriptor {
   readonly environmentId: string;
   readonly label: string;
@@ -26,7 +37,24 @@ export interface PairedEnvironment {
   readonly sessionExpiresAt: string;
   readonly pairedAt: string;
   readonly accessToken: string;
-  readonly tokenType: "Bearer";
+  readonly tokenType: "Bearer" | "DPoP";
+  readonly dpopPrivateJwk?: DpopPrivateJwk;
+  readonly accessSource?: "direct" | "connect";
+  readonly directAccess?: EnvironmentAccess;
+  readonly connectAccess?: EnvironmentAccess;
+  readonly connectAccountId?: string;
+}
+
+export interface EnvironmentAccess {
+  readonly endpoint: string;
+  readonly serverVersion: string;
+  readonly orchestrationProtocolVersion: number;
+  readonly scopes: readonly string[];
+  readonly sessionExpiresAt: string;
+  readonly pairedAt: string;
+  readonly accessToken: string;
+  readonly tokenType: "Bearer" | "DPoP";
+  readonly dpopPrivateJwk?: DpopPrivateJwk;
 }
 
 export interface PublicEnvironment {
@@ -38,6 +66,8 @@ export interface PublicEnvironment {
   readonly scopes: readonly string[];
   readonly sessionExpiresAt: string;
   readonly pairedAt: string;
+  readonly source?: "direct" | "connect";
+  readonly connectAttached?: boolean;
 }
 
 export interface PairingResult {
@@ -45,7 +75,8 @@ export interface PairingResult {
   readonly accessToken: string;
   readonly sessionExpiresAt: string;
   readonly scopes: readonly string[];
-  readonly tokenType: "Bearer";
+  readonly tokenType: "Bearer" | "DPoP";
+  readonly dpopPrivateJwk?: DpopPrivateJwk;
 }
 
 export interface PublicProject {
