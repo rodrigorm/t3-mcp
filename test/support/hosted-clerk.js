@@ -51,17 +51,42 @@ export async function startHostedClerk(state, mintJwt) {
     return { id: owner.sessionId, status: state.tasks?.length ? "pending" : "active",
       user: { id: state.accountId ?? "connect-account-a" }, currentTask: state.tasks?.[0] ?? null };
   }
+  function signIn(owner) {
+    return Object.hasOwn(state, "signInResource") ? state.signInResource : {
+      firstFactorVerification: state.firstVerification ?? owner.firstVerification ?? { status: "unverified", error: null },
+      secondFactorVerification: state.secondVerification ?? { status: null, error: null },
+    };
+  }
   const provider = await server(async (request, response, body) => {
     const url = new URL(request.url, provider.baseUrl);
     const nonce = url.searchParams.get("state") ?? new URLSearchParams(body).get("state");
     const owner = nonces.get(nonce); assert.ok(owner);
     requests.push({ method: request.method, path: `provider${url.pathname}` });
+    await state.beforeProvider?.(url.pathname, request.method);
+    if (request.method === "POST" && url.pathname === "/cancel") {
+      owner.providerCancelled = true;
+      response.writeHead(303, { location: `${app.baseUrl}/callback?state=${nonce}` }); response.end(); return;
+    }
+    if (request.method === "POST" && url.pathname === "/deny") {
+      owner.providerDenied = true;
+      response.writeHead(303, { location: `${app.baseUrl}/callback?state=${nonce}` }); response.end(); return;
+    }
     if (request.method === "POST" && url.pathname === "/verify") {
       assert.equal(new URLSearchParams(body).get("code"), "654321");
       owner.providerVerified = true;
       response.writeHead(303, { location: `${app.baseUrl}/callback?state=${nonce}` }); response.end(); return;
     }
     response.setHeader("content-type", "text/html");
+    if (owner.commandOutcome === "close") {
+      owner.firstVerification = { status: "unverified", error: null };
+      response.end(`<title>Provider window closed by operator</title><script>setTimeout(()=>window.close(),100)</script>`);
+      return;
+    }
+    if (["denied", "cancel"].includes(owner.commandOutcome)) {
+      const action = owner.commandOutcome === "denied" ? "deny" : "cancel";
+      response.end(`<form method="POST" action="/${action}"><input name="state" type="hidden" value="${nonce}"><button>${action}</button></form><script>document.querySelector('form').requestSubmit()</script>`);
+      return;
+    }
     response.end(`<h1>Fixture external provider MFA</h1><form method="POST" action="/verify"><input name="state" type="hidden" value="${nonce}"><label>Authenticator code <input name="code"></label><button>Verify</button></form><script>setTimeout(()=>{document.querySelector('[name=code]').value='654321';document.querySelector('form').requestSubmit()},100)</script>`);
   });
   const app = await server(async (request, response, body) => {
@@ -75,16 +100,30 @@ export async function startHostedClerk(state, mintJwt) {
       return json(response, { ready: true });
     }
     if (url.pathname === "/fixture/status") return json(response, { authenticated: owners.at(-1)?.authenticated ?? false });
-    if (url.pathname === "/fixture/action") return json(response, { action: owner?.command ?? null });
+    if (url.pathname === "/fixture/action") {
+      const action = owner?.command ?? null; if (owner) owner.command = null;
+      return json(response, { action });
+    }
     if (url.pathname === "/fixture/modal") { assert.ok(owner); owner.modal = true; return json(response, {}); }
     if (url.pathname === "/callback") {
       const returned = nonces.get(url.searchParams.get("state"));
-      assert.ok(returned && returned === owner && owner.providerVerified);
-      nonces.delete(url.searchParams.get("state")); owner.authenticated = true;
+      assert.ok(returned && returned === owner && (owner.providerVerified || owner.providerDenied || owner.providerCancelled));
+      nonces.delete(url.searchParams.get("state")); owner.authenticated = !!owner.providerVerified && !owner.providerDenied && !owner.providerCancelled;
+      if (owner.providerDenied) owner.firstVerification = { status: "failed",
+        error: { code: "oauth_access_denied", message: "fixture-provider-secret", longMessage: "fixture-browser-client-secret" } };
+      else owner.firstVerification = { status: owner.authenticated ? "verified" : "unverified", error: null };
+      if (owner.popup) {
+        rotate(response, owner); response.setHeader("content-type", "text/html");
+        response.end(`<title>Service popup callback</title><script>window.opener?.postMessage(${JSON.stringify({ session: owner.authenticated ? owner.sessionId : null, cancelled: !!owner.providerCancelled })},${JSON.stringify(app.baseUrl)});window.close()</script>`);
+        return;
+      }
       rotate(response, owner); response.writeHead(303, { location: "/" }); response.end(); return;
     }
     if (url.pathname === "/provider/start") {
-      assert.ok(owner); const nonce = randomUUID(); nonces.set(nonce, owner);
+      assert.ok(owner); owner.commandOutcome = url.searchParams.get("outcome");
+      owner.popup = url.searchParams.get("popup") === "1";
+      owner.providerVerified = false; owner.providerDenied = false; owner.providerCancelled = false;
+      const nonce = randomUUID(); nonces.set(nonce, owner);
       response.writeHead(303, { location: `${provider.baseUrl}/authorize?state=${nonce}` }); response.end(); return;
     }
     if (url.pathname.startsWith("/v1/")) {
@@ -98,7 +137,7 @@ export async function startHostedClerk(state, mintJwt) {
       rotate(response, owner);
       await state.beforeClerk?.(url.pathname, request.method);
       if (state.clerkStatus) return json(response, { error: "session_expired" }, state.clerkStatus);
-      if (url.pathname === "/v1/client") return json(response, { session: session(owner) });
+      if (url.pathname === "/v1/client") return json(response, { session: session(owner), signIn: signIn(owner) });
       if (url.pathname === "/v1/sign_in") {
         const form = new URLSearchParams(body);
         assert.equal(form.get("identifier"), "operator@example.test");
@@ -125,10 +164,14 @@ export async function startHostedClerk(state, mintJwt) {
 let queue=Promise.resolve();
 function request(url,fields){const next=queue.then(async()=>{const response=await fetch(url,fields?{method:'POST',body:new URLSearchParams(fields)}:{});if(!response.ok)throw Error('Service authentication failed');return response.json()});queue=next.catch(()=>{});return next}
 function install(value){window.Clerk.session=value?{...value,getToken:async options=>{if(options.template!=='t3-relay'||options.skipCache!==true)throw Error('Wrong SDK token options');const latest=await request('/v1/client');if(!latest.session||latest.session.status!=='active')return null;install(latest.session);return (await request('/v1/client/sessions/'+latest.session.id+'/tokens/t3-relay',{skip_cache:'true'})).jwt}}:null;window.Clerk.user=value?.user??null}
-window.Clerk={loaded:false,session:null,user:null,openSignIn:async()=>{document.querySelector('#modal').hidden=false;await fetch('/fixture/modal');},signOut:async options=>{await request('/v1/client/sessions/'+options.sessionId+'/end',{});install(null)}};
+async function reload(){const value=await request('/v1/client');install(value.session);Clerk.client.signIn=value.signIn;return value}
+window.Clerk={loaded:false,session:null,user:null,client:{signIn:null,reload},openSignIn:async()=>{document.querySelector('#modal').hidden=false;await fetch('/fixture/modal');},signOut:async options=>{await request('/v1/client/sessions/'+options.sessionId+'/end',{});install(null)}};
 document.querySelector('#signin').onclick=()=>Clerk.openSignIn();document.querySelector('#provider').onclick=()=>location.href='/provider/start';document.querySelector('#direct').onsubmit=async event=>{event.preventDefault();install((await request('/v1/sign_in',Object.fromEntries(new FormData(event.target)))).session)};
-request('/v1/client').then(value=>{install(value.session);Clerk.loaded=true});
-const operator=setInterval(async()=>{if(!Clerk.loaded||Clerk.session||document.querySelector('#modal').hidden)return;const action=(await fetch('/fixture/action').then(r=>r.json())).action;if(!action)return;clearInterval(operator);if(action==='provider_mfa'){document.querySelector('#provider').click();return;}document.querySelector('[name=identifier]').value='operator@example.test';document.querySelector('[name=password]').value='operator-password';document.querySelector('#direct').requestSubmit()},100);
+request('/v1/client').then(value=>{install(value.session);Clerk.client.signIn=value.signIn;Clerk.loaded=true});
+let popup=null,busy=false;
+window.addEventListener('message',async event=>{if(event.origin!==location.origin||event.source!==popup)return;await Clerk.client.reload();popup=null;busy=false});
+setInterval(async()=>{if(popup?.closed){popup=null;await Clerk.client.reload();busy=false;}},100);
+setInterval(async()=>{if(!Clerk.loaded||Clerk.session||document.querySelector('#modal').hidden||busy)return;busy=true;const action=(await fetch('/fixture/action').then(r=>r.json())).action;if(!action){busy=false;return;}if(action.startsWith('popup_')){const outcome=action==='popup_denied'?'denied':action==='popup_cancel'?'cancel':action==='popup_close'?'close':'success';popup=window.open('/provider/start?popup=1&outcome='+outcome,'service-provider','popup,width=600,height=700');return;}if(action==='provider_mfa'){document.querySelector('#provider').click();return;}if(action==='provider_denied'){location.href='/provider/start?outcome=denied';return;}document.querySelector('[name=identifier]').value='operator@example.test';document.querySelector('[name=password]').value='operator-password';document.querySelector('#direct').requestSubmit();busy=false},100);
 </script>`);
   });
   const control = { state, requests, appUrl: `${app.baseUrl}/`,

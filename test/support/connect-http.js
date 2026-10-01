@@ -29,14 +29,14 @@ export function relaySubjectJwt(audience = "t3-code-relay", subject = "connect-a
   return `${input}.${sign("sha256", Buffer.from(input), clerkKey.privateKey).toString("base64url")}`;
 }
 
-function verifyJwt(token) {
+function verifyJwt(token, now = Date.now() / 1000) {
   const [header, payload, signature, extra] = token.split(".");
   assert.equal(extra, undefined);
   assert.equal(JSON.parse(Buffer.from(header, "base64url")).alg, "RS256");
   assert.ok(verify("sha256", Buffer.from(`${header}.${payload}`), clerkKey.publicKey, Buffer.from(signature, "base64url")));
   const claims = JSON.parse(Buffer.from(payload, "base64url"));
   assert.equal(claims.iss, "https://fixture.clerk.test");
-  assert.ok(claims.sub && claims.exp > Date.now() / 1000);
+  assert.ok(claims.sub && claims.exp > now);
   return claims;
 }
 
@@ -117,10 +117,11 @@ export async function startConnectControl(environments, options = {}) {
     relayRequests.push({ method: request.method, path: request.url, headers: request.headers, body });
     if (state.outage) return json(response, { code: "unavailable", secret: state.accessToken }, 503);
     if (request.method === "GET" && request.url === "/v1/environments") {
-      await state.beforeDiscovery?.();
       assert.equal(request.headers.authorization, `Bearer ${state.accessToken}`);
-      const identity = verifyJwt(state.accessToken);
+      const identity = verifyJwt(state.accessToken, state.subjectNow);
       assert.ok([identity.aud].flat().includes("t3-code-relay"));
+      // Authenticate at request entry; the HTTP response can outlive this JWT.
+      await state.beforeDiscovery?.();
       return json(response, { environments: state.environments ?? environments.map((environment) => ({ environmentId: environment.id,
         label: environment.label ?? environment.id, endpoint: endpoint(environment), linkedAt: "2026-09-20T00:00:00.000Z" })) }, state.discoveryStatus ?? 200);
     }
@@ -134,7 +135,7 @@ export async function startConnectControl(environments, options = {}) {
       assert.equal(form.get("resource"), relay.baseUrl);
       assert.equal(form.get("scope"), "environment:connect");
       assert.ok(["t3-web", "t3-mobile"].includes(form.get("client_id")));
-      const subject = verifyJwt(form.get("subject_token"));
+      const subject = verifyJwt(form.get("subject_token"), state.subjectNow);
       assert.ok([subject.aud].flat().includes("t3-code-relay"));
       const jkt = verifyDpop(request, relay.baseUrl, replay);
       const now = Math.floor(Date.now() / 1000);

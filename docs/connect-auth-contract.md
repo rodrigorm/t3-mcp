@@ -134,3 +134,32 @@ The actual stdio connector also opened a new owned headed profile at that produc
 root, reported `browserOpened=true`, remained pending/signed out, and cancelled cleanly.
 This is signed-out UI evidence, not a production-authenticated smoke pass. The remaining
 real account/machine/project checks are in [the operator smoke guide](smoke-live.md).
+
+## Final review safeguards
+
+- The credential owner holds an OS exclusive file lock through `fs-native-extensions`.
+  Its lock inode is never unlinked or replaced, including after a crashed owner.
+  Kernel lock release, not PID guessing, arbitrates current owners. A live legacy
+  PID-only owner blocks upgrade; only an actual `ESRCH` permits that format's migration.
+  The multiprocess MCP regression starts 16 contenders after killing the real prior
+  owner, requires one winner and a stable inode, and verifies successor acquisition.
+- Each browser opening returns an identity lease. Reads and cleanup require that
+  lease, so a cancelled operation cannot close a new opening of the same retained profile.
+  Registration also rereads the current template immediately before relay exchange,
+  preserving its selected account, generation and DPoP key after slow discovery.
+- Pending login observes public first/second `VerificationResource.status` and
+  `error.code` fields. The immutable [verification types](https://github.com/clerk/javascript/blob/ee1f90a65603db0673dbb0055c89ee820c4a64fa/packages/shared/src/types/verification.ts#L7-L26)
+  define `unverified`, `verified`, `transferable`, `failed` and `expired`.
+  [Clerk error constants](https://github.com/clerk/javascript/blob/ee1f90a65603db0673dbb0055c89ee820c4a64fa/packages/shared/src/internal/clerk-js/constants.ts#L24-L55)
+  define `oauth_access_denied`. Terminal denial/expiry and malformed SDK state fail
+  safely, while retryable verification errors remain with the official UI. Error
+  details, UI text and provider strategies are not exported or used to choose a method.
+- [The pinned popup handler](https://github.com/clerk/javascript/blob/ee1f90a65603db0673dbb0055c89ee820c4a64fa/packages/clerk-js/src/utils/authenticateWithPopup.ts#L40-L80)
+  checks callback origin, reloads the client and activates the returned session.
+  Real-browser fixtures exercise `window.open`, external provider/MFA HTTP, callback
+  `postMessage`, parent SDK rehydration, denial, popup closure/retry and cancellation.
+- Playwright Core 1.63.0's client `BrowserContext.close()` returns immediately when
+  the context is already marked closed. Chrome may still finish cache/metrics writes.
+  Profile removal therefore uses bounded recursive removal retries for transient
+  busy/not-empty races, after ownership validation. A real late-writer process
+  reproduces this filesystem race; final permission and ownership errors still surface.
