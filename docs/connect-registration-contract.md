@@ -1,9 +1,9 @@
 # Connect registration contract
 
-Connect is optional and experimental. Desktop-native login obtains a real session-template
-JWT through the public Clerk Frontend API. No upstream JWT handoff change is required.
-See [authentication contract](connect-auth-contract.md) for immutable Clerk sources,
-native factors, persistence and renewal.
+Connect is optional and experimental. The connector's owned browser uses the actual
+official Clerk sign-in UI and obtains its session-template JWT through the supported SDK.
+See [authentication contract](connect-auth-contract.md) for immutable sources, all-method
+service UI delegation, browser profile persistence and renewal.
 
 ## Immutable T3 sources
 
@@ -80,7 +80,7 @@ Attachment preserves the stable saved ID, label and direct session, including le
 direct state. Direct repair selects direct access while retaining Connect access.
 Failed or stale exchanges preserve the existing registration.
 
-Sign-out removes only owned Clerk login state. Saved direct/Connect environment sessions
+Sign-out removes owned Clerk login state and its browser profile. Saved direct/Connect environment sessions
 remain usable during Clerk expiry/revocation or relay outage when the environment is
 reachable. Unregistration removes that environment's local access, without signing out
 the account or unlinking the upstream machine.
@@ -97,16 +97,18 @@ attached path's tokens/private keys. Reflected identifiers fail instead of chang
 
 ## Evidence
 
-`test/support/connect-http.js` implements controlled public native Clerk endpoints with
-single-use rotated Client API bearer credentials. Its relay independently verifies RS256
+`test/support/hosted-clerk.js` serves an external app/Clerk SDK fixture and provider with
+actual forms, redirects/MFA, HttpOnly cookie rotations and session-template HTTP. Real
+browser processes use that service, with no mocked connector/browser methods.
+`test/support/connect-http.js` independently verifies RS256
 template signatures/audience, exact exchange fields and strict DPoP proofs. Its environment
 consumes key-bound bootstrap grants and verifies opaque environment sessions and proofs.
 Fixtures model ready managed endpoints using loopback HTTP, not deployed Cloudflare tunnels.
 
 The public test boundary is actual MCP client, spawned stdio connector, controlled upstream
-HTTP and operator-form local POSTs. Auth tests cover ownership, every header rotation,
-supported factors/client trust, renewal without re-login, restart, expiry/revocation,
-reflection, configuration association, migration and concurrent cancellation/stale 401s.
+HTTP and service-owned browser forms. Auth tests cover ownership, cookie rotation,
+provider/MFA delegation, renewal without re-login, restart, expiry/revocation, closed
+browsers, reflection, profile/config association, migration and concurrent cancellation/stale 401s.
 Registration/attachment tests preserve identity, CAS, fallback, no replay and full
 project/start/read/continue/read regression coverage. The packed installed package exercises
 both registration modes and shipped smoke runners, independent sign-out/unregistration,
@@ -115,6 +117,7 @@ its disposable direct fallback so a healthy direct path cannot mask broken Conne
 
 No operator-authenticated production login, template mint, managed environment connection
 or live turn was performed in this implementation session. The remaining live check needs
-an existing account with allowed factors, ready linked machines and an authorized project/model.
+an existing account using any method offered in the official UI, an installed browser,
+ready linked machines and an authorized project/model.
 See [installed operator smoke instructions](smoke-live.md). Controlled tests and public
 production metadata are separate evidence from a real authorized workflow.

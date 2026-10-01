@@ -20,7 +20,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test test",
@@ -31,6 +31,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "playwright-core": "^1.63.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {

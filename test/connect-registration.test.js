@@ -2,17 +2,20 @@ import assert from "node:assert/strict";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { call, content, failure, fixture, login, operatorPost, relaySubjectJwt, startConnectEnvironment, success } from "./support/connect-http.js";
+import { call, content, failure, fixture, login, operatorLogin, relaySubjectJwt, startConnectEnvironment, success } from "./support/connect-http.js";
 
 test("rejects malformed or wrong-audience Clerk template subjects before authenticating or requesting a relay session", async (t) => {
   for (const accessToken of ["opaque-template-secret", relaySubjectJwt("wrong-audience")]) {
     const f = await fixture(t, [{ id: "remote", baseUrl: "http://127.0.0.1:1" }], { accessToken });
     const { client, stderr } = await f.client();
     const auth = success(await call(client, "connect_authenticate")).authentication;
-    await operatorPost(auth.authorizationUrl, "identify", { identifier: "operator@example.test" });
-    const response = await operatorPost(auth.authorizationUrl, "verify", { code: "123456" });
-    assert.equal(response.status, 400);
-    const result = await call(client, "connect_authenticate", { action: "status" });
+    await operatorLogin(auth.authorizationUrl);
+    let result;
+    for (let n = 0; n < 100; n += 1) {
+      result = await call(client, "connect_authenticate", { action: "status" });
+      if (content(result).authentication.status !== "pending") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     assert.equal(content(result).authentication.status, "failed");
     assert.equal(content(result).authentication.error.code, "upstream_incompatible");
     assert.equal(JSON.stringify(result).includes(accessToken), false);

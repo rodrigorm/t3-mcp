@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { operatorLogin, startConnectControl, verifyDpop } from "./support/connect-http.js";
+import { operatorLogin, startConnectControl, verifyDpop, waitAuthentication } from "./support/connect-http.js";
 
 const connectorPath = path.join(process.cwd(), "dist", "index.js");
 
@@ -485,7 +485,7 @@ test("authenticates with Connect, discovers without registering, attaches, regis
     const authorizationUrl = content(started).authentication.authorizationUrl;
     assert.equal(content(started).authentication.status, "pending");
     await operatorLogin(authorizationUrl);
-    assert.equal(content(await client.callTool({ name: "connect_authenticate", arguments: { action: "status" } })).authentication.status, "authenticated");
+    await waitAuthentication(client);
     assert.equal(connect.clerkRequests[0].path, "/v1/client");
     assert.ok(connect.clerkRequests.some((request) => request.path.endsWith("/tokens/t3-relay")));
 

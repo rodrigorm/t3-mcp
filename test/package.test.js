@@ -324,11 +324,11 @@ test("runs the packed package through explicit Connect registration, attachment 
       const code = await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
       clearTimeout(timer);
       await Promise.all(callbacks);
-      for (const secret of [control.state.accessToken, control.state.nativeClientToken, "direct-grant", ...remote.sessions.keys(), ...attached.sessions.keys()]) {
+      for (const secret of [control.state.accessToken, control.state.browserCookie, "direct-grant", ...remote.sessions.keys(), ...attached.sessions.keys()]) {
         assert.equal(output.includes(secret), false, "runner output must exclude credentials");
       }
       for (const line of output.trim().split("\n")) {
-        assert.ok(/^(authorization_url=http:\/\/127\.0\.0\.1:|[a-z_]+ outcome=accepted$|smoke_complete=true$|smoke_stopped reason=[a-z0-9_]+$)/.test(line), "runner must print only local authorization URLs and safe summary codes");
+        assert.ok(/^(authorization_url=http:\/\/127\.0\.0\.1:|[a-z_]+ outcome=accepted$|smoke_complete=true$|smoke_stopped reason=[a-z0-9_]+$)/.test(line), "runner must print only hosted authorization URLs and safe summary codes");
       }
       return { code, output };
     }

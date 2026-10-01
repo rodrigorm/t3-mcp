@@ -45,9 +45,10 @@ host-neutral and uses MCP tools rather than shell commands.
    `connect_authenticate` with `action=status` until authenticated, then call
    `list_connect_environments`. Discovery does not save environments; call
    `register_connect_environment` for a new saved environment or `attach_connect_environment` for
-    an existing direct registration. Open the returned loopback URL on the connector host.
-    Enter your identifier, password or verification codes only in that page. The connector
-    creates its own native Clerk client/session and verifies its `t3-relay` JWT with the relay.
+    an existing direct registration. Complete sign-in in the headed browser opened by the
+    connector at the official hosted app. Any method offered there is valid, including
+    providers and required verification. The connector owns a new private browser profile
+    and verifies its session's `t3-relay` JWT with the relay.
     See [the Desktop authentication contract](docs/connect-auth-contract.md).
 3. Call `list_environments`, select an explicit environment `id`, then call `list_projects` with
    that id. Project and thread identifiers are scoped to the selected environment.
@@ -63,18 +64,18 @@ host-neutral and uses MCP tools rather than shell commands.
    referenced thread with `get_thread` first; only then decide whether a retry is safe. Mutation
    requests are never automatically replayed.
 
-Connect uses the public Desktop defaults: Clerk key `pk_live_Y2xlcmsudDMuY29kZXMk`, template
-`t3-relay` and relay `https://relay.t3.codes`. Optional overrides are
-`T3_MCP_CONNECT_CLERK_PUBLISHABLE_KEY`, `T3_MCP_CONNECT_CLERK_JWT_TEMPLATE`,
-`T3_MCP_CONNECT_FRONTEND_API_URL` and `T3_MCP_CONNECT_RELAY_URL`.
-`T3_MCP_CONNECT_CALLBACK_PORT` defaults to an OS-assigned loopback UI port. No CLI OAuth
-client ID or token endpoint is needed.
+Connect defaults to hosted `https://app.t3.codes/`, template `t3-relay` and relay
+`https://relay.t3.codes`. Optional overrides are `T3_MCP_CONNECT_HOSTED_APP_URL`,
+`T3_MCP_CONNECT_CLERK_JWT_TEMPLATE` and `T3_MCP_CONNECT_RELAY_URL`.
+Connect discovers installed Chrome/Edge, or accepts an explicit
+`T3_MCP_CONNECT_BROWSER_EXECUTABLE` path. No browser binary is downloaded and no separate
+setup/auth CLI is required. Direct environment tools work without a browser runtime.
 
-The existing-account UI follows Clerk's offered email-code/password first factors and
-authenticator, backup, SMS or email second factors/client-trust verification. Unsupported
-social/SSO, passkey, reset, registration, session-task and challenge steps report specific
-recovery guidance. Configure an allowed factor in T3 account settings before retrying.
-The connector never captures installed Desktop callbacks or copies host login tokens.
+Clerk's official UI/SDK handle providers, MFA, passkeys and challenges. The operator alone
+enters real sign-in information in the window opened by the connector. A public URL opened
+in another browser does not authenticate this owned profile. Keep the window open until
+MCP reports authenticated. The connector never captures Desktop callbacks or copies an
+existing host/browser session.
 
 After adoption, normal turns use these MCP tools. A local turn CLI, if one is available in a host,
 is an optional debugging utility; this package never invokes `t3-turn`.
@@ -133,10 +134,10 @@ and an ambiguous transport result is `unknown` so the caller can inspect the thr
 - Redirects are rejected, so credentials are never forwarded to another origin.
 - Environment and Connect state are separate files outside the repository, owner-only, and atomically
   replaced. Connect access uses DPoP-bound keys and environment access is never included in MCP output.
-- The native Client API credential and cached template JWT have separate lifecycles. Restart
-  verifies the owned session and renews through the public session-template API. Stored native
-  state is plaintext with private permissions; run one connector process per state directory.
-- Obsolete OAuth login state requires native reauthentication. Saved environment access and
+- Owned browser cookies and the cached template JWT have separate lifecycles. Restart
+  reopens only the connector's profile headlessly and renews with the supported Clerk SDK.
+  Browser state and cached JWTs are private; run one connector process per state directory.
+- Obsolete OAuth/native login state requires browser reauthentication. Saved environment access and
   proof keys survive migration. Account switching requires explicit Connect sign-out.
 - A failed re-pair leaves the existing registration unchanged.
 
@@ -146,9 +147,9 @@ See [`docs/compatibility.md`](docs/compatibility.md) for the upstream version an
 descriptor, token exchange, scopes, and session checks used by this package.
 
 Automated compatibility coverage runs an MCP client against the connector process and controlled
-HTTP environments implementing public native Clerk, direct-pairing and relay-JWT contracts. Tests include
+HTTP environments implementing hosted Clerk SDK, direct-pairing and relay-JWT contracts. Tests include
 cryptographic DPoP validation, installed-package turns for registration and attachment, lifecycle
-isolation across restart, supported factors/client trust, client rotations, template renewal,
+actual browser processes, provider/MFA delegation, cookie rotation, template renewal, restart,
 and the packaged smoke runners. No live direct-pairing
 or Connect smoke check was run for this release because this workspace has no operator-authorized
 environment or Connect account; controlled checks must not be read as a claim that a live T3 deployment
@@ -156,6 +157,6 @@ was exercised.
 
 For repeatable installed-package verification, see [`docs/smoke-live.md`](docs/smoke-live.md).
 The optional runners require explicit targets and use fresh disposable state. They print only
-local browser authorization URLs and safe summary codes. Direct pairing remains the default.
+public hosted authorization URLs and safe summary codes. Direct pairing remains the default.
 The remaining real Connect smoke requires operator login and authorized remote machines/project.
 Public metadata checks and automated fixtures are recorded separately from live evidence.
